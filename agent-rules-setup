@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2088
+# ^ Labels quote ~/ paths for humans; they are never expanded.
 # =============================================================================
 # agent-rules-setup — provision and lint this machine's agent rules + fixes
 #
@@ -60,6 +62,7 @@
 # Usage:
 #   agent-rules-setup                 apply everything (safe to re-run)
 #   agent-rules-setup --check         report drift only, change nothing (exit 1)
+#   agent-rules-setup --lint          bash -n + shellcheck (warnings) on this script
 #   agent-rules-setup --force         also overwrite the AGENTS.md / GEMINI.md files
 #   agent-rules-setup --no-enable     install files but do not touch systemd
 #   agent-rules-setup --smoke         after applying, run a real sandbox git/gh test
@@ -113,6 +116,7 @@ PUSH=0
 RESTORE_GUIDE=0
 PRE_RESET=0
 PACKAGES_ONLY=0
+LINT=0
 
 usage() {
   awk 'f && /^# ={20,}$/ {exit} /^# Usage:/{f=1} f {sub(/^# ?/, ""); print}' "$0"
@@ -133,6 +137,7 @@ while [[ $# -gt 0 ]]; do
     --restore-guide)  RESTORE_GUIDE=1; shift ;;
     --pre-reset)      PRE_RESET=1; SNAPSHOT_MODE=1; PUSH=1; shift ;;
     --install-packages) PACKAGES_ONLY=1; shift ;;
+    --lint)           LINT=1; shift ;;
     -h|--help)        usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
@@ -163,6 +168,17 @@ fix()   { printf '  fix   %s\n' "$*"; changes=$((changes + 1)); }
 drift() { printf '  drift %s\n' "$*"; problems=$((problems + 1)); }
 note()  { printf '  note  %s\n' "$*"; }
 die()   { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+if [[ "$LINT" -eq 1 ]]; then
+  rc=0
+  bash -n "$SELF" || rc=1
+  if command -v shellcheck >/dev/null 2>&1; then
+    shellcheck -x -S warning "$SELF" || rc=1
+  else
+    note "shellcheck not installed; ran bash -n only"
+  fi
+  exit "$rc"
+fi
 
 # install_content PATH MODE FORCE_OK LABEL  (content on stdin)
 install_content() {
@@ -585,7 +601,7 @@ restore_obsidian() {
     return 0
   fi
   local dest="$OBSIDIAN_VAULT/.obsidian/plugins"
-  local plugin id count=0 missing=0
+  local plugin id count=0 missing_plugins=0
   mkdir -p "$dest"
   for plugin in "$src/plugins"/*/; do
     id="$(basename "$plugin")"
@@ -602,14 +618,14 @@ restore_obsidian() {
     fi
     if [[ "$MODE" == "check" ]]; then
       drift "Obsidian plugin missing: $id"
-      missing=$((missing + 1))
+      missing_plugins=$((missing_plugins + 1))
       continue
     fi
     cp -a "$plugin" "$dest/$id"
     count=$((count + 1))
     fix "Obsidian plugin: $id"
   done
-  if (( count == 0 && missing == 0 )); then
+  if (( count == 0 && missing_plugins == 0 )); then
     ok "Obsidian plugins"
   fi
 
@@ -1235,6 +1251,10 @@ fi
 echo "gh: mise could not update and no mise shim exists" >&2
 exit 1
 SH
+
+if [[ "$MODE" == "check" && -f "$BIN/gh" ]] && ! grep -q 'Read-only sandbox' "$BIN/gh"; then
+  note "omarchy-refresh-applications rewrites $BIN/gh; rerun this script after refreshing"
+fi
 
 install_content "$BIN/obsidian" 755 1 "obsidian (CLI bridge)" <<'PY'
 #!/usr/bin/env python3

@@ -146,6 +146,7 @@ Then back up separately:
 ```bash
 agent-rules-setup                 # apply / repair everything (safe to re-run)
 agent-rules-setup --check         # report drift only, exit 1 if anything is off
+agent-rules-setup --lint          # bash -n + shellcheck (warnings) on the script
 agent-rules-setup --smoke         # real Codex sandbox git/gh/signing test
 agent-rules-setup --install-packages  # reinstall every snapshotted pacman + AUR package
 agent-rules-setup --restore-guide # full reinstall runbook
