@@ -1,0 +1,28 @@
+{
+  "general": {
+    "defaultPermissionMode": "bypass_permissions"
+  },
+  "permissions": {
+    "allow": [
+      "*"
+    ],
+    "trustDirectories": [
+      "/home/ivanaguilera"
+    ]
+  },
+  "security": {
+    "auth": {
+      "selectedType": "qoder-browser"
+    }
+  },
+  "model": {
+    "name": "dfmodel",
+    "preferences": {
+      "dfmodel": {
+        "reasoning": {
+          "effort": "high"
+        }
+      }
+    }
+  }
+}

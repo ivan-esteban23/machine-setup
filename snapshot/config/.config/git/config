@@ -1,0 +1,44 @@
+# See https://git-scm.com/docs/git-config
+
+[alias]
+	co = checkout
+	br = branch
+	ci = commit
+	st = status
+[init]
+	defaultBranch = master
+[pull]
+	rebase = true 			 # Rebase (instead of merge) on pull
+[push]
+	autoSetupRemote = true   # Automatically set upstream branch on push
+[diff]
+	algorithm = histogram    # Clearer diffs on moved/edited lines
+	colorMoved = plain       # Highlight moved blocks in diffs
+	mnemonicPrefix = true    # More intuitive refs in diff output
+[commit]
+	verbose = true           # Include diff comment in commit message template
+	gpgsign = true
+[column]
+	ui = auto 			     # Output in columns when possible
+[branch]
+	sort = -committerdate    # Sort branches by most recent commit first
+[tag]
+	sort = -version:refname  # Sort version numbers as you would expect
+	gpgsign = true
+[rerere]
+	enabled = true           # Record and reuse conflict resolutions
+	autoupdate = true        # Apply stored conflict resolutions automatically
+[credential "https://github.com"]
+	helper = 
+	helper = !/home/ivanaguilera/.local/share/mise/shims/gh auth git-credential
+[credential "https://gist.github.com"]
+	helper = 
+	helper = !/home/ivanaguilera/.local/share/mise/shims/gh auth git-credential
+[user]
+	name = Ivan Aguilera
+	email = 221615113+ivan-esteban23@users.noreply.github.com
+	signingkey = /home/ivanaguilera/.ssh/id_ed25519_signing.pub
+[gpg]
+	format = ssh
+[gpg "ssh"]
+	allowedSignersFile = /home/ivanaguilera/.ssh/allowed_signers
