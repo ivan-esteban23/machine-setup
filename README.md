@@ -1,8 +1,8 @@
 # machine-setup
 
-Recovery kit for this Omarchy machine: agent rules, Instagram download timers, system update checks, mobile remote-control units, personal desktop/tool config, and the Codex sandbox/GitHub fixes that let `git push` and `gh pr create` complete.
+Recovery kit for this Omarchy machine: agent rules, Instagram download timers, system update checks, mobile remote-control units, personal desktop/tool config, the Omarchy Tailscale feature, the full pacman/AUR package set, Obsidian community plugins, and the Codex sandbox/GitHub fixes that let `git push` and `gh pr create` complete.
 
-Everything is in **`agent-rules-setup`** — one idempotent, self-contained bash script. `snapshot/` holds machine-specific extras (tool configs, package lists, git identity).
+Everything is in **`agent-rules-setup`** — one idempotent, self-contained bash script. `snapshot/` holds machine-specific extras (tool configs, package lists, Obsidian plugins, git identity).
 
 Print the full reinstall runbook at any time:
 
@@ -26,6 +26,9 @@ agent-rules-setup --restore-guide
 - `free-claude-code` via `uv tool install` when `uv` is available
 - git identity / signing settings and `allowed_signers` from the snapshot
 - personal config from `snapshot/config/` (only files that are missing): git aliases/ignore, starship, alacritty, Hypr bindings, Omarchy bar layout, fcitx5 profile + tray drop-in, GTK_IM_MODULE, Obsidian vault registry, VS Code settings, Qoder settings, Claude theme
+- Omarchy Tailscale feature: `tailscale` package, `tailscaled`, operator, Taildrop receive service, bar widget (browser login stays manual)
+- Qoder CLI (`qodercli`) and Antigravity CLI (`agy`) when missing
+- all 30 Obsidian community plugins + their settings from `snapshot/obsidian/` (restored once the vault exists)
 - `~/.local/bin` on `PATH` in `.bash_profile` and `.bashrc`
 - optional: the snapshotted pacman + AUR package lists (`--with-packages`)
 
@@ -51,11 +54,19 @@ Optional variants:
 ./agent-rules-setup --bootstrap --with-packages  # also reinstall pacman + AUR snapshots
 ```
 
+Reinstall the full package set at any time (repo packages via pacman, AUR via yay; names not in a configured repo are listed and skipped):
+
+```bash
+agent-rules-setup --install-packages
+agent-rules-setup --check --install-packages     # report only
+```
+
 Then finish the interactive logins:
 
 ```bash
 gh auth setup-git
 codex login
+sudo tailscale up --accept-routes     # browser auth; daemon + bar widget already set up
 ```
 
 For Instagram, log into instagram.com in Firefox and prime the saved session once:
@@ -75,15 +86,22 @@ agent-rules-setup --smoke
 
 `--smoke` starts a real Codex sandbox and checks DNS, `gh` API access, `git ls-remote`, and SSH commit signing.
 
-Sidecar tools that need their own installer (none are in this repo):
+Sidecar tools:
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh   # uv / uvx
 uv tool install free-claude-code                  # fcc-*
-# qodercli, agy (Antigravity), and reason: vendor installers
+# qodercli and agy (Antigravity) are installed automatically by agent-rules-setup
+# reason: vendor installer only
 sudo cp wg-JP-446.conf /etc/wireguard/            # from secure backup
 sudo systemctl enable --now wg-quick@wg-JP-446
 ```
+
+Obsidian plugins (30, with settings) are restored automatically into
+`~/Documents/Obsidian Vault/.obsidian/plugins` and merged into
+`community-plugins.json`. If the vault is copied after the first bootstrap run,
+run `agent-rules-setup` again; plugin `data.json` files containing token-like
+values are deliberately not snapshotted.
 
 ## NOT in this repo
 
@@ -100,7 +118,7 @@ Never commit these; restore them from your secure backup:
 | `~/.bashrc` | contains `TAVILY_API_KEY` |
 | `/etc/wireguard/wg-JP-446.conf` | VPN private key (root-owned) |
 | `~/Downloads` | Instagram archives |
-| `~/Work`, `~/Documents/Obsidian Vault` | personal data |
+| `~/Work`, `~/Documents/Obsidian Vault` | personal data (only the plugin folders are in `snapshot/obsidian/`) |
 | `~/Pictures`, `~/Videos` | personal media |
 
 If the signing key is missing, bootstrap turns `commit.gpgsign` off and prints instructions. Do not regenerate it unless you register the new public key as a GitHub signing key.
@@ -129,6 +147,7 @@ Then back up separately:
 agent-rules-setup                 # apply / repair everything (safe to re-run)
 agent-rules-setup --check         # report drift only, exit 1 if anything is off
 agent-rules-setup --smoke         # real Codex sandbox git/gh/signing test
+agent-rules-setup --install-packages  # reinstall every snapshotted pacman + AUR package
 agent-rules-setup --restore-guide # full reinstall runbook
 agent-rules-setup --snapshot --push  # refresh snapshot/ and push it
 ```

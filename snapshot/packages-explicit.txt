@@ -148,6 +148,7 @@ sushi
 system-config-printer
 systemd-resolvconf
 t3code-bin
+tailscale
 tensaku
 tesseract
 tesseract-data-eng

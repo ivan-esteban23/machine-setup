@@ -1,0 +1,35 @@
+/*
+ * One column of numbers: while the plugin draws its own, Obsidian's shows
+ * nothing. CodeMirror's base theme forces `display: flex` on every gutter
+ * with top priority, so the gutter itself cannot be hidden; emptying it
+ * (every element gone, no width) has the same effect.
+ */
+.hln-active .cm-gutter.cm-lineNumbers:not(.hln-gutter) {
+  width: 0;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.hln-active .cm-gutter.cm-lineNumbers:not(.hln-gutter) .cm-gutterElement {
+  display: none;
+}
+
+/* Digits of equal width, so the column does not wobble as the cursor moves. */
+.hln-gutter {
+  font-variant-numeric: tabular-nums;
+}
+
+.hln-gutter .hln-current {
+  color: var(--text-normal);
+}
+
+/* Line numbers that select their line show it with the pointer. */
+.hln-select-lines .hln-gutter .cm-gutterElement {
+  cursor: pointer;
+}
+
+.hln-goto-input {
+  width: 100%;
+}

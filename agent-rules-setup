@@ -40,6 +40,14 @@
 #        git aliases/ignore, starship, alacritty, Hypr bindings, Omarchy bar,
 #        fcitx5 profile + systemd drop-in, GTK_IM_MODULE, Obsidian vault
 #        registry, VS Code settings, Qoder settings, Claude theme
+#   6. Omarchy extras
+#        Tailscale feature: tailscaled, operator, Taildrop receive service,
+#        bar plugin (browser auth stays manual; admin web app via Omarchy menu)
+#        Qoder CLI and Antigravity CLI installed with their official installers
+#        Every explicit pacman + AUR package from the snapshot (--install-packages)
+#   7. Obsidian community plugins
+#        snapshot/obsidian/ holds all plugin files + settings; missing plugin
+#        folders are restored and enabled in community-plugins.json
 #
 # Why Codex used to block PR completion:
 #   * default read-only sandbox has no DNS/network -> gh and git push fail
@@ -57,6 +65,7 @@
 #   agent-rules-setup --smoke         after applying, run a real sandbox git/gh test
 #   agent-rules-setup --restore-guide print the full reinstall/restore runbook
 #   agent-rules-setup --pre-reset     snapshot + push, then print the wipe checklist
+#   agent-rules-setup --install-packages  reinstall every snapshotted pacman + AUR package
 #
 # Recovery on a fresh Omarchy install (mise is part of Omarchy; it is not
 # reinstalled here):
@@ -71,6 +80,10 @@
 #                                                   pacman/AUR package lists too
 #   ./agent-rules-setup --snapshot                  refresh snapshot/ from this machine
 #   ./agent-rules-setup --snapshot --push           snapshot, commit, and push the repo
+#
+# Omarchy Tailscale feature (also run by --bootstrap):
+#   tailscaled enabled, Taildrop receive service, bar plugin.
+#   One manual step remains: sudo tailscale up --accept-routes (browser login).
 #
 # NOT included (never commit these; restore from a secure backup):
 #   ~/.ssh/id_ed25519_signing         private signing key
@@ -99,6 +112,7 @@ SNAPSHOT_MODE=0
 PUSH=0
 RESTORE_GUIDE=0
 PRE_RESET=0
+PACKAGES_ONLY=0
 
 usage() {
   awk 'f && /^# ={20,}$/ {exit} /^# Usage:/{f=1} f {sub(/^# ?/, ""); print}' "$0"
@@ -118,6 +132,7 @@ while [[ $# -gt 0 ]]; do
     --push)           PUSH=1; shift ;;
     --restore-guide)  RESTORE_GUIDE=1; shift ;;
     --pre-reset)      PRE_RESET=1; SNAPSHOT_MODE=1; PUSH=1; shift ;;
+    --install-packages) PACKAGES_ONLY=1; shift ;;
     -h|--help)        usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
@@ -135,6 +150,7 @@ BIN="$HOME_DIR/.local/bin"
 UNIT_DIR="$HOME_DIR/.config/systemd/user"
 CODEX_HOME="${CODEX_HOME:-$HOME_DIR/.codex}"
 CODEX_CONFIG="$CODEX_HOME/config.toml"
+OBSIDIAN_VAULT="${OBSIDIAN_VAULT:-$HOME_DIR/Documents/Obsidian Vault}"
 TIMERS=(pdm-clara-autodl.timer julie-autodl.timer system-update-check.timer)
 SERVICES=(codex-remote-control.service qoder-remote-control.service)
 
@@ -437,6 +453,195 @@ bootstrap_uv_tool() {
   fi
 }
 
+bootstrap_tailscale() {
+  if ! command -v tailscale >/dev/null 2>&1; then
+    if [[ "$MODE" == "check" ]]; then
+      drift "tailscale missing (Omarchy feature)"
+      return 0
+    fi
+    if sudo_n pacman -S --needed --noconfirm tailscale; then
+      fix "tailscale installed"
+    else
+      drift "tailscale install failed"
+      return 0
+    fi
+  else
+    ok "tailscale package"
+  fi
+
+  if systemctl is-enabled --quiet tailscaled.service 2>/dev/null \
+    && systemctl is-active --quiet tailscaled.service 2>/dev/null; then
+    ok "tailscaled"
+  elif [[ "$MODE" == "check" ]]; then
+    drift "tailscaled not enabled/active"
+  else
+    if sudo_n systemctl enable --now tailscaled.service; then
+      fix "tailscaled enabled"
+    else
+      drift "tailscaled could not be enabled"
+    fi
+  fi
+
+  if systemctl --user is-enabled --quiet omarchy-tailscale-receive.service 2>/dev/null; then
+    ok "Taildrop receive service"
+  elif [[ "$MODE" == "check" ]]; then
+    drift "Taildrop receive service disabled"
+  else
+    if systemctl --user enable --now omarchy-tailscale-receive.service 2>/dev/null; then
+      fix "Taildrop receive service enabled"
+    else
+      note "omarchy-tailscale-receive.service unavailable"
+    fi
+  fi
+
+  if command -v omarchy-plugin-enable >/dev/null 2>&1; then
+    if jq -e '[.bar.layout[]?[]? | if type == "object" then .id else . end]
+              | index("omarchy.tailscale")' \
+      "$HOME_DIR/.config/omarchy/shell.json" >/dev/null 2>&1; then
+      ok "Omarchy Tailscale bar plugin"
+    elif [[ "$MODE" == "check" ]]; then
+      drift "Omarchy Tailscale bar plugin disabled"
+    else
+      # The shell IPC occasionally exceeds its 2s timeout; one retry fixes it.
+      if omarchy-plugin-enable omarchy.tailscale >/dev/null 2>&1 \
+        || { sleep 2; omarchy-plugin-enable omarchy.tailscale >/dev/null 2>&1; }; then
+        fix "Omarchy Tailscale bar plugin enabled"
+      else
+        note "could not enable the Omarchy Tailscale bar plugin"
+      fi
+    fi
+  fi
+
+  if systemctl is-active --quiet tailscaled.service 2>/dev/null; then
+    if sudo_n tailscale set --operator="$USER" >/dev/null 2>&1; then
+      ok "tailscale operator"
+    else
+      note "could not set the Tailscale operator"
+    fi
+    if tailscale status >/dev/null 2>&1; then
+      ok "tailscale logged in"
+    else
+      note "Tailscale not logged in: run 'sudo tailscale up --accept-routes'"
+    fi
+  fi
+}
+
+bootstrap_sidecars() {
+  if command -v qodercli >/dev/null 2>&1; then
+    ok "Qoder CLI"
+  elif [[ "$MODE" == "check" ]]; then
+    drift "Qoder CLI missing"
+  else
+    if curl -fsSL https://qoder.com/install | bash; then
+      fix "Qoder CLI installed"
+    else
+      drift "Qoder CLI install failed"
+    fi
+  fi
+
+  if command -v agy >/dev/null 2>&1; then
+    ok "Antigravity CLI"
+  elif [[ "$MODE" == "check" ]]; then
+    drift "Antigravity CLI missing"
+  else
+    if curl -fsSL https://antigravity.google/cli/install.sh | bash; then
+      fix "Antigravity CLI installed"
+    else
+      drift "Antigravity CLI install failed"
+    fi
+  fi
+}
+
+snapshot_obsidian() {
+  local vault="$OBSIDIAN_VAULT" dir="$SNAPSHOT_DIR/obsidian"
+  if [[ ! -d "$vault/.obsidian" ]]; then
+    note "Obsidian vault not found at $vault; plugins not snapshotted"
+    return 0
+  fi
+  mkdir -p "$dir/plugins"
+  if [[ -f "$vault/.obsidian/community-plugins.json" ]]; then
+    cp "$vault/.obsidian/community-plugins.json" "$dir/community-plugins.json"
+  fi
+  local plugin id count=0
+  for plugin in "$vault/.obsidian/plugins"/*/; do
+    [[ -f "$plugin/manifest.json" ]] || continue
+    id="$(basename "$plugin")"
+    mkdir -p "$dir/plugins/$id"
+    cp -a "$plugin/." "$dir/plugins/$id/"
+    if [[ -f "$plugin/data.json" ]] && has_secret "$plugin/data.json"; then
+      rm -f "$dir/plugins/$id/data.json"
+      note "Obsidian plugin $id: data.json has a token-like value; skipped"
+    fi
+    count=$((count + 1))
+  done
+  ok "Obsidian plugins: $count"
+}
+
+restore_obsidian() {
+  local src="$SNAPSHOT_DIR/obsidian"
+  [[ -d "$src/plugins" ]] || return 0
+  if [[ ! -d "$OBSIDIAN_VAULT/.obsidian" ]]; then
+    note "Obsidian vault missing; restore the vault, then rerun to install plugins"
+    return 0
+  fi
+  local dest="$OBSIDIAN_VAULT/.obsidian/plugins"
+  local plugin id count=0 missing=0
+  mkdir -p "$dest"
+  for plugin in "$src/plugins"/*/; do
+    id="$(basename "$plugin")"
+    if [[ -d "$dest/$id" ]]; then
+      if [[ -f "$plugin/data.json" && ! -f "$dest/$id/data.json" ]]; then
+        if [[ "$MODE" == "check" ]]; then
+          drift "Obsidian plugin settings missing: $id"
+        else
+          cp -p "$plugin/data.json" "$dest/$id/data.json"
+          fix "Obsidian plugin settings: $id"
+        fi
+      fi
+      continue
+    fi
+    if [[ "$MODE" == "check" ]]; then
+      drift "Obsidian plugin missing: $id"
+      missing=$((missing + 1))
+      continue
+    fi
+    cp -a "$plugin" "$dest/$id"
+    count=$((count + 1))
+    fix "Obsidian plugin: $id"
+  done
+  if (( count == 0 && missing == 0 )); then
+    ok "Obsidian plugins"
+  fi
+
+  [[ -f "$src/community-plugins.json" ]] || return 0
+  if [[ "$MODE" == "check" ]]; then
+    return 0
+  fi
+  python3 - "$src/community-plugins.json" "$OBSIDIAN_VAULT/.obsidian/community-plugins.json" <<'PY'
+import json, sys
+
+src, dest = sys.argv[1], sys.argv[2]
+try:
+    with open(src, encoding="utf-8") as fh:
+        wanted = json.load(fh)
+except Exception:
+    sys.exit(0)
+try:
+    with open(dest, encoding="utf-8") as fh:
+        current = json.load(fh)
+except Exception:
+    current = []
+if not isinstance(current, list):
+    current = []
+added = [p for p in wanted if p not in current]
+if not added:
+    sys.exit(0)
+with open(dest, "w", encoding="utf-8") as fh:
+    json.dump(current + added, fh, indent=2)
+    fh.write("\n")
+PY
+}
+
 git_set_if_empty() {
   local key="$1" val="$2"
   if [[ -z "$val" ]]; then
@@ -526,28 +731,81 @@ bootstrap_linger() {
   fi
 }
 
+install_all_packages() {
+  local exp="$SNAPSHOT_DIR/packages-explicit.txt" aur_file="$SNAPSHOT_DIR/packages-aur.txt"
+  if [[ ! -s "$exp" ]]; then
+    note "no explicit package snapshot; run --snapshot first"
+    return 0
+  fi
+
+  local repo_list installed p
+  local -a official=() aur=() skipped=() missing=()
+  repo_list="$(mktemp)"
+  installed="$(mktemp)"
+  pacman -Ssq 2>/dev/null | sort -u >"$repo_list" || true
+  pacman -Qq 2>/dev/null | sort -u >"$installed" || true
+
+  if [[ -s "$aur_file" ]]; then
+    mapfile -t aur <"$aur_file"
+  fi
+  while IFS= read -r p; do
+    [[ -n "$p" ]] || continue
+    if [[ ${#aur[@]} -gt 0 ]] && printf '%s\n' "${aur[@]}" | grep -qxF "$p"; then
+      continue
+    fi
+    if grep -qxF "$p" "$repo_list"; then
+      official+=("$p")
+    else
+      skipped+=("$p")
+    fi
+  done <"$exp"
+
+  if [[ "$MODE" == "check" ]]; then
+    if (( ${#official[@]} + ${#aur[@]} == 0 )); then
+      ok "packages: no snapshot entries"
+      rm -f "$repo_list" "$installed"
+      return 0
+    fi
+    mapfile -t missing < <(
+      { printf '%s\n' "${official[@]}" "${aur[@]}"; } | sort -u | comm -23 - "$installed"
+    )
+    if (( ${#missing[@]} == 0 )); then
+      ok "packages: ${#official[@]} repo + ${#aur[@]} AUR installed"
+    else
+      drift "packages missing: ${missing[*]}"
+    fi
+    rm -f "$repo_list" "$installed"
+    return 0
+  fi
+
+  local failed=0
+  if (( ${#official[@]} > 0 )); then
+    if printf '%s\n' "${official[@]}" | xargs -r -n 50 sudo -n pacman -S --needed --noconfirm; then
+      fix "repo packages installed (${#official[@]})"
+    else
+      drift "some repo packages failed (see pacman output)"
+      failed=1
+    fi
+  fi
+  if (( ${#aur[@]} > 0 )); then
+    if ! command -v yay >/dev/null 2>&1; then
+      note "yay missing; AUR packages skipped (${aur[*]})"
+    elif yay -S --needed --noconfirm "${aur[@]}"; then
+      fix "AUR packages installed (${#aur[@]})"
+    else
+      drift "some AUR packages failed (see yay output)"
+      failed=1
+    fi
+  fi
+  if (( ${#skipped[@]} > 0 )); then
+    note "not in any configured repo: ${skipped[*]}"
+  fi
+  rm -f "$repo_list" "$installed"
+  return "$failed"
+}
+
 bootstrap_packages() {
-  local exp="$SNAPSHOT_DIR/packages-explicit.txt" aur="$SNAPSHOT_DIR/packages-aur.txt"
-  if [[ -s "$exp" ]]; then
-    if xargs -r -n 50 sudo -n pacman -S --needed --noconfirm <"$exp"; then
-      fix "explicit package list restored"
-    else
-      drift "some explicit packages failed (see pacman output)"
-    fi
-  else
-    note "no explicit package snapshot"
-  fi
-  if [[ -s "$aur" ]]; then
-    if command -v yay >/dev/null 2>&1; then
-      if xargs -r -n 30 yay -S --needed --noconfirm <"$aur"; then
-        fix "AUR package list restored"
-      else
-        drift "some AUR packages failed (see yay output)"
-      fi
-    else
-      note "yay missing; AUR package list skipped"
-    fi
-  fi
+  install_all_packages
 }
 
 bootstrap_all() {
@@ -611,6 +869,7 @@ snapshot_all() {
   fi
 
   snapshot_configs
+  snapshot_obsidian
 
   git config --global --get user.name >"$dir/git-user-name" 2>/dev/null || :
   git config --global --get user.email >"$dir/git-user-email" 2>/dev/null || :
@@ -682,8 +941,18 @@ print_post_restore() {
     printf '  %d. Instagram session: already present\n' "$n"
   fi
   n=$((n + 1))
-  printf '  %d. reinstall sidecar CLIs with their own installers:\n' "$n"
-  printf '       qodercli (Qoder), agy (Antigravity), reason, uv + free-claude-code\n'
+  if tailscale status >/dev/null 2>&1; then
+    printf '  %d. Tailscale: already logged in\n' "$n"
+  else
+    printf '  %d. Tailscale login (browser auth):\n' "$n"
+    printf '       sudo tailscale up --accept-routes\n'
+  fi
+  n=$((n + 1))
+  printf '  %d. sidecar CLIs: qodercli and agy were installed automatically;\n' "$n"
+  printf '       only the Reason app needs its vendor installer\n'
+  n=$((n + 1))
+  printf '  %d. Obsidian plugins restore with the vault; if the vault was missing:\n' "$n"
+  printf '       agent-rules-setup --restore-guide (rerun after copying the vault)\n'
   n=$((n + 1))
   printf '  %d. VPN: restore /etc/wireguard/wg-JP-446.conf (root), then:\n' "$n"
   printf '       sudo systemctl enable --now wg-quick@wg-JP-446\n'
@@ -732,6 +1001,7 @@ After reinstalling Omarchy
   # 3. Interactive logins
   gh auth setup-git
   codex login
+  sudo tailscale up --accept-routes     # browser auth; script enables the daemon
 
   # 4. Instagram: log into instagram.com in Firefox, then prime the session
   ig-download pdm.clara --new-only --cookies firefox
@@ -740,13 +1010,31 @@ After reinstalling Omarchy
   agent-rules-setup --check
   agent-rules-setup --smoke
 
-Sidecar tools that need their own installer
--------------------------------------------
-  uv / uvx              curl -LsSf https://astral.sh/uv/install.sh | sh
-  free-claude-code      uv tool install free-claude-code
-  qodercli              Qoder CLI installer
-  agy                   Antigravity installer
-  reason                Reason app installer
+Packages (main repo + AUR)
+--------------------------
+  ./agent-rules-setup --bootstrap --with-packages   # during bootstrap
+  agent-rules-setup --install-packages              # standalone, any time
+  agent-rules-setup --check --install-packages      # report only
+
+  Reinstalls every snapshotted package: official ones from pacman, AUR ones
+  from yay. Names are matched against `pacman -Ssq`; anything not in a
+  configured repo is listed and skipped instead of aborting the transaction.
+
+Sidecar tools
+-------------
+  qodercli     installed automatically (Qoder official installer)
+  agy          installed automatically (Antigravity official installer)
+  reason       vendor installer only
+  uv / uvx     curl -LsSf https://astral.sh/uv/install.sh | sh
+  free-claude-code  uv tool install free-claude-code
+
+Obsidian plugins
+----------------
+  All community plugins and their settings are snapshotted under
+  snapshot/obsidian/ (manifest, main.js, styles.css, data.json) together with
+  community-plugins.json. They are restored automatically into
+  ~/Documents/Obsidian Vault/.obsidian/plugins once the vault exists.
+  Files that look like they contain a token are never snapshotted.
 
 Restored automatically from snapshot/config/
 --------------------------------------------
@@ -770,6 +1058,14 @@ GUIDE
 # -----------------------------------------------------------------------------
 if (( RESTORE_GUIDE )); then
   print_restore_guide
+  exit 0
+fi
+
+if (( PACKAGES_ONLY )); then
+  install_all_packages
+  if (( problems > 0 )); then
+    exit 1
+  fi
   exit 0
 fi
 
@@ -798,6 +1094,7 @@ fi
 if [[ -d "$SNAPSHOT_DIR/config" ]]; then
   restore_configs
 fi
+restore_obsidian
 
 # -----------------------------------------------------------------------------
 # 1. Rule files (never clobber local annotations unless --force)
@@ -1590,7 +1887,13 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# 4. Codex config: keep read-only default, allow network for workspace-write
+# 4. Omarchy extras: Tailscale feature, Qoder CLI, Antigravity CLI
+# -----------------------------------------------------------------------------
+bootstrap_tailscale
+bootstrap_sidecars
+
+# -----------------------------------------------------------------------------
+# 5. Codex config: keep read-only default, allow network for workspace-write
 # -----------------------------------------------------------------------------
 codex_config_patch() {
   local mode="$1"
@@ -1775,13 +2078,11 @@ check_runtime() {
   else
     note "uv missing (sidecar installer: curl -LsSf https://astral.sh/uv/install.sh | sh)"
   fi
-  for c in qodercli agy reason; do
-    if command -v "$c" >/dev/null 2>&1; then
-      ok "sidecar CLI: $c"
-    else
-      note "sidecar CLI missing: $c (install with its vendor installer)"
-    fi
-  done
+  if command -v reason >/dev/null 2>&1; then
+    ok "sidecar CLI: reason"
+  else
+    note "sidecar CLI missing: reason (install with its vendor installer)"
+  fi
   if sudo_n test -f /etc/wireguard/wg-JP-446.conf 2>/dev/null; then
     ok "WireGuard config"
   else

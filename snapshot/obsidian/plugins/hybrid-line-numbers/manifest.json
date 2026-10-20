@@ -1,0 +1,10 @@
+{
+  "id": "hybrid-line-numbers",
+  "name": "Hybrid Line Numbers",
+  "version": "0.3.0",
+  "minAppVersion": "0.15.0",
+  "description": "Relative and hybrid line numbers for Vim-style jumps. A folded section counts as one line, and numbers can turn absolute in Vim insert mode.",
+  "author": "Siulved54",
+  "authorUrl": "https://github.com/perezamadorluisenrique-gif",
+  "isDesktopOnly": false
+}
