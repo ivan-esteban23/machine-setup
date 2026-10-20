@@ -28,6 +28,7 @@ agent-rules-setup --restore-guide
 - git identity / signing settings and `allowed_signers` from the snapshot
 - personal config from `snapshot/config/` (only files that are missing): git aliases/ignore, starship, alacritty, Hypr bindings, Omarchy bar layout, fcitx5 profile + tray drop-in, GTK_IM_MODULE, Obsidian vault registry, VS Code settings, Qoder settings, Claude theme
 - Omarchy Tailscale feature: `tailscale` package, `tailscaled`, operator, Taildrop receive service, bar widget (browser login stays manual)
+- SSH access: `openssh`, `sshd` enabled, `ufw limit 22/tcp` staged (the firewall itself stays off so LAN services keep working). Password auth is turned off only once `~/.ssh/authorized_keys` holds a key; pass `--ssh-key=<file.pub>` to add the phone's key in the same run, and the hardening reverts if the key disappears
 - Qoder CLI (`qodercli`) and Antigravity CLI (`agy`) when missing
 - all 30 Obsidian community plugins + their settings from `snapshot/obsidian/` (restored once the vault exists)
 - `~/.local/bin` on `PATH` in `.bash_profile` and `.bashrc`
@@ -53,6 +54,7 @@ Optional variants:
 ```bash
 ./agent-rules-setup --bootstrap --minimal        # only gh + codex (skip the full mise set)
 ./agent-rules-setup --bootstrap --with-packages  # also reinstall pacman + AUR snapshots
+./agent-rules-setup --ssh-key=~/phone.pub        # authorize a key, then require key-only SSH
 ```
 
 Reinstall the full package set at any time (repo packages via pacman, AUR via yay; names not in a configured repo are listed and skipped):

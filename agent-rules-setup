@@ -69,6 +69,7 @@
 #   agent-rules-setup --force         also overwrite the AGENTS.md / GEMINI.md files
 #   agent-rules-setup --no-enable     install files but do not touch systemd
 #   agent-rules-setup --smoke         after applying, run a real sandbox git/gh test
+#   agent-rules-setup --ssh-key=F     authorize public key F, then require key auth
 #   agent-rules-setup --restore-guide print the full reinstall/restore runbook
 #   agent-rules-setup --pre-reset     snapshot + push, then print the wipe checklist
 #   agent-rules-setup --install-packages  reinstall every snapshotted pacman + AUR package
@@ -90,6 +91,13 @@
 # Omarchy Tailscale feature (also run by --bootstrap):
 #   tailscaled enabled, Taildrop receive service, bar plugin.
 #   One manual step remains: sudo tailscale up --accept-routes (browser login).
+#
+# SSH access (also run on every apply/check):
+#   openssh installed, sshd enabled, and `ufw limit 22/tcp` staged. The firewall
+#   is never enabled here: qBittorrent listens on the LAN (16581) and default-deny
+#   would cut it off. Password auth is disabled only once ~/.ssh/authorized_keys
+#   holds a key and is reverted if the file empties, so hardening can never lock
+#   the phone out. Add the phone's key first: --ssh-key=<file.pub>.
 #
 # NOT included (never commit these; restore from a secure backup):
 #   ~/.ssh/id_ed25519_signing         private signing key
@@ -121,6 +129,7 @@ PRE_RESET=0
 PACKAGES_ONLY=0
 LINT=0
 REPAIR_GH=0
+SSH_KEY=""
 
 usage() {
   awk 'f && /^# ={20,}$/ {exit} /^# Usage:/{f=1} f {sub(/^# ?/, ""); print}' "$0"
@@ -143,6 +152,8 @@ while [[ $# -gt 0 ]]; do
     --install-packages) PACKAGES_ONLY=1; shift ;;
     --lint)           LINT=1; shift ;;
     --repair-gh)      REPAIR_GH=1; shift ;;
+    --ssh-key=*)      SSH_KEY="${1#*=}"; shift ;;
+    --ssh-key)        SSH_KEY="${2:?--ssh-key needs a file}"; shift 2 ;;
     -h|--help)        usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
@@ -573,6 +584,122 @@ bootstrap_tailscale() {
     else
       note "Tailscale not logged in: run 'sudo tailscale up --accept-routes'"
     fi
+  fi
+}
+
+bootstrap_ssh() {
+  local conf="/etc/ssh/sshd_config.d/10-omarchy-hardening.conf"
+  local ak="$HOME_DIR/.ssh/authorized_keys"
+  local line body want have_key=0
+
+  ensure_pkgs openssh
+
+  if systemctl is-enabled --quiet sshd.service 2>/dev/null \
+    && systemctl is-active --quiet sshd.service 2>/dev/null; then
+    ok "sshd"
+  elif [[ "$MODE" == "check" ]]; then
+    drift "sshd not enabled/active"
+  elif sudo_n systemctl enable --now sshd.service; then
+    fix "sshd enabled"
+  else
+    drift "sshd could not be enabled"
+  fi
+
+  # Stage the rule only: ufw stays inactive because the LAN services
+  # (qBittorrent on 16581) are reachable through it.
+  if command -v ufw >/dev/null 2>&1; then
+    if sudo_n ufw show added 2>/dev/null | grep -q '^ufw limit 22/tcp'; then
+      ok "ufw rule: limit 22/tcp (staged)"
+    elif [[ "$MODE" == "check" ]]; then
+      drift "ufw rule missing: limit 22/tcp"
+    elif sudo_n ufw limit 22/tcp comment "omarchy-sshd" >/dev/null 2>&1; then
+      fix "ufw rule staged: limit 22/tcp"
+    else
+      drift "could not stage ufw rule: limit 22/tcp"
+    fi
+    if sudo_n ufw status 2>/dev/null | grep -q '^Status: inactive'; then
+      note "ufw inactive; enabling it needs allow rules for qBittorrent (16581)"
+    fi
+  else
+    note "ufw not installed; SSH rate limit not staged"
+  fi
+
+  if [[ -n "$SSH_KEY" ]]; then
+    if [[ ! -r "$SSH_KEY" ]]; then
+      drift "ssh key unreadable: $SSH_KEY"
+    elif ! line="$(awk 'NF >= 2 && $1 !~ /^#/ {print; exit}' "$SSH_KEY")" \
+      || ! body="$(awk '{print $2}' <<<"$line")" \
+      || [[ -z "$body" ]] || ! ssh-keygen -lf <(printf '%s\n' "$line") >/dev/null 2>&1; then
+      drift "not a usable SSH public key: $SSH_KEY"
+    elif [[ -f "$ak" ]] && grep -qF -- "$body" "$ak"; then
+      ok "ssh authorized key: $SSH_KEY"
+    elif [[ "$MODE" == "check" ]]; then
+      drift "ssh key not authorized: $SSH_KEY"
+    else
+      mkdir -p "$HOME_DIR/.ssh"
+      chmod 700 "$HOME_DIR/.ssh"
+      touch "$ak"
+      chmod 600 "$ak"
+      printf '%s\n' "$line" >>"$ak"
+      fix "ssh authorized key: $SSH_KEY"
+    fi
+  fi
+
+  if [[ -s "$ak" ]] && grep -qvE '^[[:space:]]*(#|$)' "$ak"; then
+    have_key=1
+  fi
+
+  if (( ! have_key )); then
+    note "no authorized SSH key; password auth stays on"
+    if [[ -f "$conf" ]]; then
+      if [[ "$MODE" == "check" ]]; then
+        drift "sshd key-only hardening without an authorized key (lockout risk)"
+      else
+        sudo_n rm -f "$conf"
+        sudo_n systemctl reload sshd.service 2>/dev/null || true
+        fix "sshd hardening reverted (no authorized key)"
+      fi
+    fi
+    return 0
+  fi
+
+  want=$'PasswordAuthentication no\nKbdInteractiveAuthentication no'
+  # Capture once: `grep -q` closes the pipe early and pipefail would report
+  # sshd's SIGPIPE as a failure. sshd -T also prints mixed-case key names.
+  local eff
+  eff="$(sudo_n sshd -T 2>/dev/null || true)"
+  if grep -qix 'passwordauthentication no' <<<"$eff" \
+    && grep -qix 'kbdinteractiveauthentication no' <<<"$eff"; then
+    ok "sshd: key-only auth"
+    return 0
+  fi
+  if [[ "$MODE" == "check" ]]; then
+    drift "sshd password auth still enabled (authorized key present)"
+    return 0
+  fi
+
+  local tmp
+  tmp="$(mktemp)"
+  printf '%s\n' "$want" >"$tmp"
+  if [[ -f "$conf" && ! -e "$conf.bak-agent-rules" ]]; then
+    sudo_n cp -p "$conf" "$conf.bak-agent-rules"
+  fi
+  if sudo_n install -m 644 "$tmp" "$conf" && sudo_n sshd -t && sudo_n sshd -T >/dev/null; then
+    rm -f "$tmp"
+    if sudo_n systemctl reload sshd.service; then
+      fix "sshd: key-only auth"
+    else
+      drift "sshd reload failed"
+    fi
+  else
+    rm -f "$tmp"
+    if [[ -e "$conf.bak-agent-rules" ]]; then
+      sudo_n cp -p "$conf.bak-agent-rules" "$conf"
+    else
+      sudo_n rm -f "$conf"
+    fi
+    sudo_n systemctl reload sshd.service 2>/dev/null || true
+    drift "sshd rejected the hardening drop-in; password auth left on"
   fi
 }
 
@@ -1965,9 +2092,10 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# 4. Omarchy extras: Tailscale feature, Qoder CLI, Antigravity CLI
+# 4. Omarchy extras: Tailscale feature, SSH access, Qoder CLI, Antigravity CLI
 # -----------------------------------------------------------------------------
 bootstrap_tailscale
+bootstrap_ssh
 bootstrap_sidecars
 
 # -----------------------------------------------------------------------------
