@@ -33,6 +33,8 @@
 #        system-update-check.timer  every 3h, calendar-based       (fixed)
 #        codex-remote-control.service   Codex mobile/browser access
 #        qoder-remote-control.service   Qoder mobile/browser access
+#        gh-wrapper-watch.path          restores the gh wrapper when
+#                                       omarchy-refresh-applications rewrites it
 #      The old OnBootSec/OnUnitActiveSec pair can wedge at next_elapse=0
 #      after a failed run; OnCalendar + RemainAfterElapse=no cannot.
 #   4. ~/.codex/config.toml
@@ -63,6 +65,7 @@
 #   agent-rules-setup                 apply everything (safe to re-run)
 #   agent-rules-setup --check         report drift only, change nothing (exit 1)
 #   agent-rules-setup --lint          bash -n + shellcheck (warnings) on this script
+#   agent-rules-setup --repair-gh     reinstall just the gh wrapper (watch unit)
 #   agent-rules-setup --force         also overwrite the AGENTS.md / GEMINI.md files
 #   agent-rules-setup --no-enable     install files but do not touch systemd
 #   agent-rules-setup --smoke         after applying, run a real sandbox git/gh test
@@ -117,6 +120,7 @@ RESTORE_GUIDE=0
 PRE_RESET=0
 PACKAGES_ONLY=0
 LINT=0
+REPAIR_GH=0
 
 usage() {
   awk 'f && /^# ={20,}$/ {exit} /^# Usage:/{f=1} f {sub(/^# ?/, ""); print}' "$0"
@@ -138,6 +142,7 @@ while [[ $# -gt 0 ]]; do
     --pre-reset)      PRE_RESET=1; SNAPSHOT_MODE=1; PUSH=1; shift ;;
     --install-packages) PACKAGES_ONLY=1; shift ;;
     --lint)           LINT=1; shift ;;
+    --repair-gh)      REPAIR_GH=1; shift ;;
     -h|--help)        usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
@@ -158,6 +163,7 @@ CODEX_CONFIG="$CODEX_HOME/config.toml"
 OBSIDIAN_VAULT="${OBSIDIAN_VAULT:-$HOME_DIR/Documents/Obsidian Vault}"
 TIMERS=(pdm-clara-autodl.timer julie-autodl.timer system-update-check.timer)
 SERVICES=(codex-remote-control.service qoder-remote-control.service)
+WATCH_UNITS=(gh-wrapper-watch.path)
 
 changes=0
 problems=0
@@ -228,6 +234,34 @@ install_self() {
   fi
   install_content "$BIN/agent-rules-setup" 755 1 "agent-rules-setup" <"$SELF"
 }
+
+install_gh_wrapper() {
+  install_content "$BIN/gh" 755 1 "gh (read-only fallback)" <<'SH'
+#!/bin/bash
+export MISE_MINIMUM_RELEASE_AGE=0
+if mise use -g --quiet "gh" 2>/dev/null; then
+  exec mise x "gh" -- "gh" "$@"
+fi
+# Read-only sandbox (/home is not writable): `mise use` cannot rewrite config.
+# Fall back to the already-installed shim so gh/git credential/PR work works.
+shim="$HOME/.local/share/mise/shims/gh"
+if [ -x "$shim" ]; then
+  exec "$shim" "$@"
+fi
+echo "gh: mise could not update and no mise shim exists" >&2
+exit 1
+SH
+
+  if [[ "$MODE" == "check" && -f "$BIN/gh" ]] && ! grep -q 'Read-only sandbox' "$BIN/gh"; then
+    note "omarchy-refresh-applications rewrites $BIN/gh; rerun this script after refreshing"
+  fi
+}
+
+if [[ "$REPAIR_GH" -eq 1 ]]; then
+  MODE="apply"
+  install_gh_wrapper
+  exit 0
+fi
 
 # -----------------------------------------------------------------------------
 # Recovery helpers — Omarchy ships mise in the base image, so it is assumed
@@ -1236,25 +1270,7 @@ exec codex \
   "$@"
 SH
 
-install_content "$BIN/gh" 755 1 "gh (read-only fallback)" <<'SH'
-#!/bin/bash
-export MISE_MINIMUM_RELEASE_AGE=0
-if mise use -g --quiet "gh" 2>/dev/null; then
-  exec mise x "gh" -- "gh" "$@"
-fi
-# Read-only sandbox (/home is not writable): `mise use` cannot rewrite config.
-# Fall back to the already-installed shim so gh/git credential/PR work works.
-shim="$HOME/.local/share/mise/shims/gh"
-if [ -x "$shim" ]; then
-  exec "$shim" "$@"
-fi
-echo "gh: mise could not update and no mise shim exists" >&2
-exit 1
-SH
-
-if [[ "$MODE" == "check" && -f "$BIN/gh" ]] && ! grep -q 'Read-only sandbox' "$BIN/gh"; then
-  note "omarchy-refresh-applications rewrites $BIN/gh; rerun this script after refreshing"
-fi
+install_gh_wrapper
 
 install_content "$BIN/obsidian" 755 1 "obsidian (CLI bridge)" <<'PY'
 #!/usr/bin/env python3
@@ -1844,6 +1860,27 @@ RestartSec=15
 WantedBy=default.target
 UNIT
 
+install_content "$UNIT_DIR/gh-wrapper-repair.service" 644 1 "gh-wrapper-repair.service" <<'UNIT'
+[Unit]
+Description=Restore the sandbox-safe gh wrapper
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/agent-rules-setup --repair-gh
+UNIT
+
+install_content "$UNIT_DIR/gh-wrapper-watch.path" 644 1 "gh-wrapper-watch.path" <<'UNIT'
+[Unit]
+Description=Watch ~/.local/bin/gh for omarchy wrapper rewrites
+
+[Path]
+PathChanged=%h/.local/bin/gh
+Unit=gh-wrapper-repair.service
+
+[Install]
+WantedBy=default.target
+UNIT
+
 have_systemd() { systemctl --user show-environment >/dev/null 2>&1; }
 
 if [[ "$ENABLE" -eq 1 ]] && have_systemd; then
@@ -1882,6 +1919,18 @@ if [[ "$ENABLE" -eq 1 ]] && have_systemd; then
         drift "$s could not be enabled"
       fi
     done
+    for p in "${WATCH_UNITS[@]}"; do
+      was="$(systemctl --user is-enabled "$p" 2>/dev/null || true)"
+      if systemctl --user enable --now "$p" >/dev/null 2>&1; then
+        if [[ "$was" == "enabled" ]]; then
+          ok "$p enabled"
+        else
+          fix "$p enabled"
+        fi
+      else
+        drift "$p could not be enabled"
+      fi
+    done
   else
     for t in "${TIMERS[@]}"; do
       state="$(systemctl --user is-enabled "$t" 2>/dev/null || true)"
@@ -1899,6 +1948,15 @@ if [[ "$ENABLE" -eq 1 ]] && have_systemd; then
         ok "$s enabled"
       else
         drift "$s (enabled=$state)"
+      fi
+    done
+    for p in "${WATCH_UNITS[@]}"; do
+      state="$(systemctl --user is-enabled "$p" 2>/dev/null || true)"
+      active="$(systemctl --user is-active "$p" 2>/dev/null || true)"
+      if [[ "$state" == "enabled" && "$active" == "active" ]]; then
+        ok "$p enabled"
+      else
+        drift "$p (enabled=$state active=$active)"
       fi
     done
   fi

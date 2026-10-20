@@ -21,6 +21,7 @@ agent-rules-setup --restore-guide
 - systemd user services (enabled):
   - `codex-remote-control.service` — Codex mobile/browser access
   - `qoder-remote-control.service` — Qoder mobile/browser access
+  - `gh-wrapper-watch.path` — restores the sandbox-safe `gh` wrapper whenever `omarchy-refresh-applications` rewrites it
 - Codex: default sandbox stays `read-only`; `[sandbox_workspace_write] network_access = true`
 - mise global tool set from `snapshot/mise-config.toml`
 - `free-claude-code` via `uv tool install` when `uv` is available
