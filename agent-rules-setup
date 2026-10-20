@@ -35,15 +35,18 @@
 #        qoder-remote-control.service   Qoder mobile/browser access
 #        gh-wrapper-watch.path          restores the gh wrapper when
 #                                       omarchy-refresh-applications rewrites it
+#        gh-wrapper-repair.service      oneshot worker for the watch path
 #      The old OnBootSec/OnUnitActiveSec pair can wedge at next_elapse=0
 #      after a failed run; OnCalendar + RemainAfterElapse=no cannot.
 #   4. ~/.codex/config.toml
 #        sandbox_mode stays "read-only"; [sandbox_workspace_write] gets
 #        network_access = true so codex-git and PR work have DNS + HTTPS.
-#   5. Snapshot-managed personal config (copied only when missing)
+#   5. Snapshot-managed personal config (restored only when missing; a
+#      differing local copy is kept and reported as a note)
 #        git aliases/ignore, starship, alacritty, Hypr bindings, Omarchy bar,
 #        fcitx5 profile + systemd drop-in, GTK_IM_MODULE, Obsidian vault
-#        registry, VS Code settings, Qoder settings, Claude theme
+#        registry, VS Code settings, Qoder settings, Claude theme, PLUS
+#        mise config, codex config and SSH allowed_signers (plain apply)
 #   6. Omarchy extras
 #        Tailscale feature: tailscaled, operator, Taildrop receive service,
 #        bar plugin (browser auth stays manual; admin web app via Omarchy menu)
@@ -51,7 +54,9 @@
 #        Every explicit pacman + AUR package from the snapshot (--install-packages)
 #   7. Obsidian community plugins
 #        snapshot/obsidian/ holds all plugin files + settings; missing plugin
-#        folders are restored and enabled in community-plugins.json
+#        folders are restored and enabled in community-plugins.json. Snapshots
+#        of uninstalled plugins are pruned when the vault is readable, and any
+#        file with a token-like value is never snapshotted.
 #
 # Why Codex used to block PR completion:
 #   * default read-only sandbox has no DNS/network -> gh and git push fail
@@ -62,19 +67,27 @@
 #   the gh wrapper's read-only fallback. SSH commit signing works in-sandbox.
 #
 # Usage:
-#   agent-rules-setup                 apply everything (safe to re-run)
-#   agent-rules-setup --check         report drift only, change nothing (exit 1)
-#   agent-rules-setup --lint          bash -n + shellcheck (warnings) on this script
-#   agent-rules-setup --repair-gh     reinstall just the gh wrapper (watch unit)
-#   agent-rules-setup --pause-ig      skip hourly Instagram downloads (timers stay enabled)
-#   agent-rules-setup --resume-ig     clear the Instagram pause marker
+#   agent-rules-setup                 apply everything (safe to re-run; same as --apply)
+#   agent-rules-setup --check         report drift only: no writes, mkdirs or chmods
+#                                     (non-mutating sudo probes like sshd -T are used)
 #   agent-rules-setup --force         also overwrite the AGENTS.md / GEMINI.md files
-#   agent-rules-setup --no-enable     install files but do not touch systemd
-#   agent-rules-setup --smoke         after applying, run a real sandbox git/gh test
-#   agent-rules-setup --ssh-key=F     authorize public key F, then require key auth
+#   agent-rules-setup --no-enable     skip user units, sshd/tailscaled/linger changes
+#   agent-rules-setup --smoke         apply, then run a real sandbox git/gh/signing test
+#   agent-rules-setup --bootstrap     fresh-machine setup: deps, mise, configs, linger
+#   agent-rules-setup --with-packages  with --bootstrap: reinstall the package lists
+#   agent-rules-setup --minimal       with --bootstrap: only gh + codex
+#   agent-rules-setup --snapshot      refresh snapshot/ from this machine (prunes stale)
+#   agent-rules-setup --push          with --snapshot: commit (pathspec) and push
 #   agent-rules-setup --restore-guide print the full reinstall/restore runbook
 #   agent-rules-setup --pre-reset     snapshot + push, then print the wipe checklist
 #   agent-rules-setup --install-packages  reinstall every snapshotted pacman + AUR package
+#   agent-rules-setup --lint          bash -n + shellcheck (warnings) on this script
+#   agent-rules-setup --repair-gh     reinstall the gh wrapper + enable its watch path
+#   agent-rules-setup --pause-ig      skip hourly Instagram downloads (timers stay enabled)
+#   agent-rules-setup --resume-ig     clear the Instagram pause marker
+#   agent-rules-setup --ssh-key=F     authorize public key F, then require key auth
+#
+# Exit codes: 0 = in place, 1 = drift/problems remain, 2 = invalid flag combination.
 #
 # Recovery on a fresh Omarchy install (mise is part of Omarchy; it is not
 # reinstalled here):
@@ -165,6 +178,29 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+bad_args() { printf 'error: %s\n' "$*" >&2; exit 2; }
+
+if (( PAUSE_IG && RESUME_IG )); then
+  bad_args "--pause-ig and --resume-ig are mutually exclusive"
+fi
+if [[ "$MODE" == "check" ]]; then
+  if (( SNAPSHOT_MODE )); then
+    bad_args "--check cannot be combined with --snapshot/--pre-reset"
+  fi
+  if (( PUSH )); then
+    bad_args "--check cannot be combined with --push"
+  fi
+  if (( REPAIR_GH )); then
+    bad_args "--check cannot be combined with --repair-gh"
+  fi
+  if (( PAUSE_IG || RESUME_IG )); then
+    bad_args "--check cannot be combined with --pause-ig/--resume-ig"
+  fi
+fi
+if (( PUSH && ! SNAPSHOT_MODE )); then
+  bad_args "--push requires --snapshot (or --pre-reset)"
+fi
+
 HOME_DIR="${HOME:?HOME is not set}"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 REPO_DIR="$(cd "$(dirname "$SELF")" && pwd)"
@@ -183,6 +219,22 @@ IG_TIMERS=(pdm-clara-autodl.timer julie-autodl.timer)
 IG_PAUSE_MARKER="$HOME_DIR/.local/state/instagram-paused"
 SERVICES=(codex-remote-control.service qoder-remote-control.service)
 WATCH_UNITS=(gh-wrapper-watch.path)
+
+# Running ~/.local/bin/gh executes `mise use -g`, which rewrites the mise
+# config; prefer the shim for read-only probes.
+gh_bin() {
+  local p="$HOME_DIR/.local/share/mise/shims/gh"
+  if [[ -x "$p" ]]; then
+    printf '%s\n' "$p"
+    return 0
+  fi
+  p="$(command -v gh 2>/dev/null || true)"
+  if [[ -n "$p" && "$p" != "$BIN/gh" ]]; then
+    printf '%s\n' "$p"
+    return 0
+  fi
+  return 1
+}
 
 changes=0
 problems=0
@@ -208,25 +260,41 @@ fi
 # install_content PATH MODE FORCE_OK LABEL  (content on stdin)
 install_content() {
   local path="$1" mode="$2" force_ok="$3" label="$4"
-  local tmp
+  local tmp cur
   LAST_CHANGED=0
+
+  if [[ "$MODE" == "check" ]]; then
+    if [[ ! -f "$path" ]]; then
+      drift "$label (missing)"
+      return 0
+    fi
+    cur="$(stat -Lc %a "$path" 2>/dev/null || true)"
+    if cmp -s - "$path"; then
+      if [[ "$cur" == "$mode" ]]; then
+        ok "$label"
+      else
+        drift "$label (mode ${cur:-?}, want $mode)"
+      fi
+    else
+      drift "$label (out of date)"
+    fi
+    return 0
+  fi
+
   tmp="$(mktemp)"
   cat >"$tmp"
 
   if [[ -f "$path" ]] && cmp -s "$tmp" "$path"; then
-    chmod "$mode" "$path" 2>/dev/null || true
-    ok "$label"
+    cur="$(stat -Lc %a "$path" 2>/dev/null || true)"
     rm -f "$tmp"
-    return 0
-  fi
-
-  if [[ "$MODE" == "check" ]]; then
-    if [[ -f "$path" ]]; then
-      drift "$label (out of date)"
+    if [[ "$cur" == "$mode" ]]; then
+      ok "$label"
+    elif chmod "$mode" "$path" 2>/dev/null; then
+      LAST_CHANGED=1
+      fix "$label (mode)"
     else
-      drift "$label (missing)"
+      drift "$label (mode ${cur:-?}, chmod failed)"
     fi
-    rm -f "$tmp"
     return 0
   fi
 
@@ -279,20 +347,43 @@ SH
 if [[ "$REPAIR_GH" -eq 1 ]]; then
   MODE="apply"
   install_gh_wrapper
+  if [[ "$ENABLE" -eq 0 ]]; then
+    note "gh-wrapper-watch.path not enabled (--no-enable)"
+  elif systemctl --user show-environment >/dev/null 2>&1; then
+    systemctl --user daemon-reload
+    was="$(systemctl --user is-enabled gh-wrapper-watch.path 2>/dev/null || true)"
+    if systemctl --user enable --now gh-wrapper-watch.path >/dev/null 2>&1; then
+      if [[ "$was" == "enabled" ]]; then
+        ok "gh-wrapper-watch.path enabled"
+      else
+        fix "gh-wrapper-watch.path enabled"
+      fi
+    else
+      drift "gh-wrapper-watch.path could not be enabled"
+    fi
+  else
+    note "systemd user bus unavailable; gh-wrapper-watch.path not enabled"
+  fi
   exit 0
 fi
 
-if (( PAUSE_IG || RESUME_IG )); then
-  if [[ "$MODE" == "check" ]]; then
-    die "--pause-ig/--resume-ig cannot be combined with --check"
-  fi
-  if (( PAUSE_IG )); then
+if (( PAUSE_IG )); then
+  if [[ -e "$IG_PAUSE_MARKER" ]]; then
+    ok "Instagram timers already paused ($IG_PAUSE_MARKER)"
+  else
     mkdir -p "$(dirname "$IG_PAUSE_MARKER")"
     : >"$IG_PAUSE_MARKER"
     fix "Instagram timers paused ($IG_PAUSE_MARKER); --resume-ig re-enables downloads"
-  else
+  fi
+  exit 0
+fi
+
+if (( RESUME_IG )); then
+  if [[ -e "$IG_PAUSE_MARKER" ]]; then
     rm -f "$IG_PAUSE_MARKER"
     fix "Instagram timers resumed; the next hourly elapse downloads again"
+  else
+    ok "Instagram downloads already active (no pause marker)"
   fi
   exit 0
 fi
@@ -357,17 +448,42 @@ backup_once() {
   fi
 }
 
+# restore_file SRC DEST MODE LABEL [POLICY]  POLICY: overwrite (default) | missing-only
 restore_file() {
-  local src="$1" dest="$2" mode="$3" label="$4"
+  local src="$1" dest="$2" mode="$3" label="$4" policy="${5:-overwrite}"
+  local cur
   if [[ ! -f "$src" ]]; then
     return 0
   fi
-  if [[ -f "$dest" ]] && cmp -s "$src" "$dest"; then
-    ok "$label"
-    return 0
+  if [[ -f "$dest" ]]; then
+    cur="$(stat -Lc %a "$dest" 2>/dev/null || true)"
+    if cmp -s "$src" "$dest"; then
+      if [[ "$cur" == "$mode" ]]; then
+        ok "$label"
+        return 0
+      fi
+      if [[ "$MODE" == "check" ]]; then
+        drift "$label (mode ${cur:-?}, want $mode)"
+        return 0
+      fi
+      if chmod "$mode" "$dest" 2>/dev/null; then
+        fix "$label (mode)"
+      else
+        drift "$label (mode ${cur:-?}, chmod failed)"
+      fi
+      return 0
+    fi
+    if [[ "$policy" == "missing-only" ]]; then
+      note "$label (differs from snapshot; local copy kept)"
+      return 0
+    fi
   fi
   if [[ "$MODE" == "check" ]]; then
-    ok "$label"
+    if [[ -f "$dest" ]]; then
+      drift "$label (out of date)"
+    else
+      drift "$label (missing)"
+    fi
     return 0
   fi
   mkdir -p "$(dirname "$dest")"
@@ -407,12 +523,14 @@ CONFIG_MANIFEST=(
 )
 
 has_secret() {
-  grep -qE 'gh[pousr]_[A-Za-z0-9]{20,}|github_pat_|sk-[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{20,}|xox[baprs]-|tvly-[A-Za-z0-9_-]{10,}|BEGIN [A-Z ]*PRIVATE KEY' "$1"
+  [[ -f "$1" ]] || return 1
+  grep -qE 'gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|AIza[0-9A-Za-z_-]{20,}|xox[baprs]-[A-Za-z0-9-]+|tvly-[A-Za-z0-9_-]{10,}|BEGIN [A-Z ]*PRIVATE KEY|(AKIA|ASIA)[0-9A-Z]{16}' "$1" \
+    || grep -qEi '(^|[^A-Za-z0-9])([A-Za-z0-9_]*_)?(KEY|TOKEN|SECRET)[A-Za-z0-9_]*[[:space:]]*=[[:space:]]*["'\'']?[A-Za-z0-9/+_-]{16,}' "$1"
 }
 
 snapshot_configs() {
-  local dir="$SNAPSHOT_DIR/config" rel src count=0
-  local skipped=()
+  local dir="$SNAPSHOT_DIR/config" rel src count=0 f known
+  local skipped=() pruned=()
   mkdir -p "$dir"
   for rel in "${CONFIG_MANIFEST[@]}"; do
     src="$HOME_DIR/$rel"
@@ -429,6 +547,26 @@ snapshot_configs() {
   if (( ${#skipped[@]} > 0 )); then
     note "config with token-like values skipped: ${skipped[*]}"
   fi
+
+  # Drop snapshot copies of configs no longer in the manifest.
+  while IFS= read -r f; do
+    rel="${f#"$dir"/}"
+    known=0
+    for src in "${CONFIG_MANIFEST[@]}"; do
+      if [[ "$rel" == "$src" ]]; then
+        known=1
+        break
+      fi
+    done
+    if (( known == 0 )); then
+      rm -f "$f"
+      pruned+=("$rel")
+    fi
+  done < <(find "$dir" -type f)
+  if (( ${#pruned[@]} > 0 )); then
+    note "pruned stale config snapshots: ${pruned[*]}"
+  fi
+  find "$dir" -mindepth 1 -type d -empty -delete 2>/dev/null || true
 }
 
 restore_configs() {
@@ -489,11 +627,14 @@ EOF
 }
 
 bootstrap_mise() {
+  local missing_tools
   if ! command -v mise >/dev/null 2>&1; then
     die "mise not found; a fresh Omarchy install provides it (pacman -S mise-bin)"
   fi
   if (( MINIMAL )); then
-    if MISE_YES=1 mise use -g gh@latest codex@latest; then
+    if mise which gh >/dev/null 2>&1 && mise which codex >/dev/null 2>&1; then
+      ok "mise tools: gh, codex"
+    elif MISE_YES=1 mise use -g gh@latest codex@latest; then
       fix "mise tools: gh, codex"
     else
       drift "mise tools: gh, codex"
@@ -502,7 +643,10 @@ bootstrap_mise() {
     return 0
   fi
   restore_file "$SNAPSHOT_DIR/mise-config.toml" "$HOME_DIR/.config/mise/config.toml" 644 "mise config"
-  if MISE_YES=1 mise install; then
+  missing_tools="$(MISE_YES=1 mise ls --missing 2>/dev/null || true)"
+  if [[ -z "$missing_tools" ]]; then
+    ok "mise tools"
+  elif MISE_YES=1 mise install; then
     fix "mise install"
   else
     drift "mise install (some tools failed)"
@@ -514,6 +658,27 @@ bootstrap_configs() {
   restore_configs
   restore_file "$SNAPSHOT_DIR/codex-config.toml" "$CODEX_HOME/config.toml" 600 "codex config"
   restore_file "$SNAPSHOT_DIR/allowed_signers" "$HOME_DIR/.ssh/allowed_signers" 644 "SSH allowed signers"
+}
+
+# Plain apply/check: create these only when missing; never clobber a local copy.
+restore_bootstrap_files() {
+  restore_file "$SNAPSHOT_DIR/mise-config.toml" "$HOME_DIR/.config/mise/config.toml" 644 "mise config" missing-only
+  restore_file "$SNAPSHOT_DIR/codex-config.toml" "$CODEX_HOME/config.toml" 600 "codex config" missing-only
+  restore_file "$SNAPSHOT_DIR/allowed_signers" "$HOME_DIR/.ssh/allowed_signers" 644 "SSH allowed signers" missing-only
+}
+
+check_bootstrap_state() {
+  restore_bootstrap_files
+  local linger name email
+  linger=$(loginctl show-user "$USER" -p Linger 2>/dev/null || true)
+  if [[ "$linger" != "Linger=yes" ]]; then
+    note "linger disabled; run --bootstrap (timers stop at logout)"
+  fi
+  name="$(git config --global --get user.name 2>/dev/null || true)"
+  email="$(git config --global --get user.email 2>/dev/null || true)"
+  if [[ -z "$name" || -z "$email" ]]; then
+    note "git identity incomplete; run --bootstrap"
+  fi
 }
 
 bootstrap_uv_tool() {
@@ -553,7 +718,9 @@ bootstrap_tailscale() {
     ok "tailscale package"
   fi
 
-  if systemctl is-enabled --quiet tailscaled.service 2>/dev/null \
+  if [[ "$ENABLE" -eq 0 ]]; then
+    note "tailscaled (skipped; --no-enable)"
+  elif systemctl is-enabled --quiet tailscaled.service 2>/dev/null \
     && systemctl is-active --quiet tailscaled.service 2>/dev/null; then
     ok "tailscaled"
   elif [[ "$MODE" == "check" ]]; then
@@ -566,7 +733,9 @@ bootstrap_tailscale() {
     fi
   fi
 
-  if systemctl --user is-enabled --quiet omarchy-tailscale-receive.service 2>/dev/null; then
+  if [[ "$ENABLE" -eq 0 ]]; then
+    note "Taildrop receive service (skipped; --no-enable)"
+  elif systemctl --user is-enabled --quiet omarchy-tailscale-receive.service 2>/dev/null; then
     ok "Taildrop receive service"
   elif [[ "$MODE" == "check" ]]; then
     drift "Taildrop receive service disabled"
@@ -578,7 +747,9 @@ bootstrap_tailscale() {
     fi
   fi
 
-  if command -v omarchy-plugin-enable >/dev/null 2>&1; then
+  if ! command -v jq >/dev/null 2>&1; then
+    note "jq missing; cannot verify the Omarchy Tailscale bar plugin"
+  elif command -v omarchy-plugin-enable >/dev/null 2>&1; then
     if jq -e '[.bar.layout[]?[]? | if type == "object" then .id else . end]
               | index("omarchy.tailscale")' \
       "$HOME_DIR/.config/omarchy/shell.json" >/dev/null 2>&1; then
@@ -597,10 +768,14 @@ bootstrap_tailscale() {
   fi
 
   if systemctl is-active --quiet tailscaled.service 2>/dev/null; then
-    if sudo_n tailscale set --operator="$USER" >/dev/null 2>&1; then
-      ok "tailscale operator"
-    else
-      note "could not set the Tailscale operator"
+    if [[ "$ENABLE" -eq 0 ]]; then
+      note "tailscale operator (skipped; --no-enable)"
+    elif [[ "$MODE" == "apply" ]]; then
+      if sudo_n tailscale set --operator="$USER" >/dev/null 2>&1; then
+        ok "tailscale operator"
+      else
+        note "could not set the Tailscale operator"
+      fi
     fi
     if tailscale status >/dev/null 2>&1; then
       ok "tailscale logged in"
@@ -613,11 +788,14 @@ bootstrap_tailscale() {
 bootstrap_ssh() {
   local conf="/etc/ssh/sshd_config.d/10-omarchy-hardening.conf"
   local ak="$HOME_DIR/.ssh/authorized_keys"
-  local line body want have_key=0
+  local sshdir="$HOME_DIR/.ssh"
+  local line body want have_key=0 perms ktype kdata
 
   ensure_pkgs openssh
 
-  if systemctl is-enabled --quiet sshd.service 2>/dev/null \
+  if [[ "$ENABLE" -eq 0 ]]; then
+    note "sshd (skipped; --no-enable)"
+  elif systemctl is-enabled --quiet sshd.service 2>/dev/null \
     && systemctl is-active --quiet sshd.service 2>/dev/null; then
     ok "sshd"
   elif [[ "$MODE" == "check" ]]; then
@@ -647,6 +825,33 @@ bootstrap_ssh() {
     note "ufw not installed; SSH rate limit not staged"
   fi
 
+  # StrictModes rejects a world-readable authorized_keys: fix perms before
+  # hardening, or a valid key still cannot log in.
+  if [[ -d "$sshdir" ]]; then
+    perms="$(stat -Lc %a "$sshdir" 2>/dev/null || true)"
+    if [[ "$perms" == "700" ]]; then
+      ok ".ssh permissions"
+    elif [[ "$MODE" == "check" ]]; then
+      drift ".ssh permissions (${perms:-?}, want 700)"
+    elif chmod 700 "$sshdir"; then
+      fix ".ssh permissions (700)"
+    else
+      drift ".ssh permissions could not be fixed"
+    fi
+  fi
+  if [[ -f "$ak" ]]; then
+    perms="$(stat -Lc %a "$ak" 2>/dev/null || true)"
+    if [[ "$perms" == "600" ]]; then
+      ok "authorized_keys permissions"
+    elif [[ "$MODE" == "check" ]]; then
+      drift "authorized_keys permissions (${perms:-?}, want 600)"
+    elif chmod 600 "$ak"; then
+      fix "authorized_keys permissions (600)"
+    else
+      drift "authorized_keys permissions could not be fixed"
+    fi
+  fi
+
   if [[ -n "$SSH_KEY" ]]; then
     if [[ ! -r "$SSH_KEY" ]]; then
       drift "ssh key unreadable: $SSH_KEY"
@@ -668,12 +873,22 @@ bootstrap_ssh() {
     fi
   fi
 
-  if [[ -s "$ak" ]] && grep -qvE '^[[:space:]]*(#|$)' "$ak"; then
-    have_key=1
+  # Only lines whose key material parses with ssh-keygen count; options-
+  # prefixed lines work because the type field is located first.
+  if [[ -f "$ak" ]]; then
+    while IFS= read -r line; do
+      [[ -n "${line//[[:space:]]/}" ]] || continue
+      read -r ktype kdata <<<"$(awk '{for (i=1;i<=NF;i++) if ($i ~ /^(ssh-|ecdsa-|sk-)/) {print $i, $(i+1); exit}}' <<<"$line")"
+      [[ -n "$ktype" && -n "$kdata" ]] || continue
+      if ssh-keygen -lf <(printf '%s %s\n' "$ktype" "$kdata") >/dev/null 2>&1; then
+        have_key=1
+        break
+      fi
+    done <"$ak"
   fi
 
   if (( ! have_key )); then
-    note "no authorized SSH key; password auth stays on"
+    note "no valid authorized SSH key; password auth stays on"
     if [[ -f "$conf" ]]; then
       if [[ "$MODE" == "check" ]]; then
         drift "sshd key-only hardening without an authorized key (lockout risk)"
@@ -710,7 +925,14 @@ bootstrap_ssh() {
   if sudo_n install -m 644 "$tmp" "$conf" && sudo_n sshd -t && sudo_n sshd -T >/dev/null; then
     rm -f "$tmp"
     if sudo_n systemctl reload sshd.service; then
-      fix "sshd: key-only auth"
+      # Re-probe: another drop-in can win on order and silently keep passwords.
+      eff="$(sudo_n sshd -T 2>/dev/null || true)"
+      if grep -qix 'passwordauthentication no' <<<"$eff" \
+        && grep -qix 'kbdinteractiveauthentication no' <<<"$eff"; then
+        fix "sshd: key-only auth"
+      else
+        drift "sshd effective config overridden (check sshd_config.d order)"
+      fi
     else
       drift "sshd reload failed"
     fi
@@ -760,7 +982,11 @@ snapshot_obsidian() {
   fi
   mkdir -p "$dir/plugins"
   if [[ -f "$vault/.obsidian/community-plugins.json" ]]; then
-    cp "$vault/.obsidian/community-plugins.json" "$dir/community-plugins.json"
+    if has_secret "$vault/.obsidian/community-plugins.json"; then
+      note "community-plugins.json has a token-like value; NOT snapshotted"
+    else
+      cp "$vault/.obsidian/community-plugins.json" "$dir/community-plugins.json"
+    fi
   fi
   local plugin id count=0
   for plugin in "$vault/.obsidian/plugins"/*/; do
@@ -775,6 +1001,21 @@ snapshot_obsidian() {
     count=$((count + 1))
   done
   ok "Obsidian plugins: $count"
+
+  # Prune snapshots of plugins uninstalled from the vault, but only when at
+  # least one plugin was read (guards against wiping the snapshot when the
+  # vault is detached or unreadable).
+  local plugins_dir="$vault/.obsidian/plugins" keeper
+  if [[ -d "$plugins_dir" && -r "$plugins_dir" && "$count" -gt 0 ]]; then
+    for keeper in "$dir/plugins"/*/; do
+      [[ -d "$keeper" ]] || continue
+      id="$(basename "$keeper")"
+      if [[ ! -d "$plugins_dir/$id" ]]; then
+        rm -rf "$dir/plugins/$id"
+        note "pruned Obsidian plugin snapshot: $id"
+      fi
+    done
+  fi
 }
 
 restore_obsidian() {
@@ -786,7 +1027,9 @@ restore_obsidian() {
   fi
   local dest="$OBSIDIAN_VAULT/.obsidian/plugins"
   local plugin id count=0 missing_plugins=0
-  mkdir -p "$dest"
+  if [[ "$MODE" != "check" ]]; then
+    mkdir -p "$dest"
+  fi
   for plugin in "$src/plugins"/*/; do
     id="$(basename "$plugin")"
     if [[ -d "$dest/$id" ]]; then
@@ -814,10 +1057,38 @@ restore_obsidian() {
   fi
 
   [[ -f "$src/community-plugins.json" ]] || return 0
-  if [[ "$MODE" == "check" ]]; then
+  local cdest="$OBSIDIAN_VAULT/.obsidian/community-plugins.json" missing_ids n
+  missing_ids="$(python3 - "$src/community-plugins.json" "$cdest" <<'PY'
+import json, sys
+
+src, dest = sys.argv[1], sys.argv[2]
+try:
+    with open(src, encoding="utf-8") as fh:
+        wanted = json.load(fh)
+except Exception:
+    sys.exit(0)
+try:
+    with open(dest, encoding="utf-8") as fh:
+        current = json.load(fh)
+except Exception:
+    current = []
+if not isinstance(current, list):
+    current = []
+if not isinstance(wanted, list):
+    sys.exit(0)
+print(" ".join(p for p in wanted if p not in current))
+PY
+)" || true
+  if [[ -z "$missing_ids" ]]; then
+    ok "Obsidian community plugins"
     return 0
   fi
-  python3 - "$src/community-plugins.json" "$OBSIDIAN_VAULT/.obsidian/community-plugins.json" <<'PY'
+  if [[ "$MODE" == "check" ]]; then
+    drift "Obsidian community plugins disabled: $missing_ids"
+    return 0
+  fi
+  backup_once "$cdest"
+  python3 - "$src/community-plugins.json" "$cdest" <<'PY'
 import json, sys
 
 src, dest = sys.argv[1], sys.argv[2]
@@ -840,6 +1111,8 @@ with open(dest, "w", encoding="utf-8") as fh:
     json.dump(current + added, fh, indent=2)
     fh.write("\n")
 PY
+  n=$(wc -w <<<"$missing_ids")
+  fix "Obsidian community plugins enabled ($n)"
 }
 
 git_set_if_empty() {
@@ -918,6 +1191,10 @@ bootstrap_linger() {
   linger=$(loginctl show-user "$USER" -p Linger 2>/dev/null || true)
   if [[ "$linger" == "Linger=yes" ]]; then
     ok "linger enabled"
+    return 0
+  fi
+  if [[ "$ENABLE" -eq 0 ]]; then
+    note "linger disabled (skipped; --no-enable)"
     return 0
   fi
   if [[ "$MODE" == "check" ]]; then
@@ -1039,26 +1316,37 @@ snapshot_all() {
   mkdir -p "$dir"
 
   if command -v pacman >/dev/null 2>&1; then
-    pacman -Qqe >"$dir/packages-explicit.txt"
-    pacman -Qqm >"$dir/packages-aur.txt"
-    ok "packages: $(wc -l <"$dir/packages-explicit.txt") explicit, $(wc -l <"$dir/packages-aur.txt") foreign"
+    local tmp_exp tmp_aur
+    tmp_exp="$(mktemp "$dir/.packages-explicit.XXXXXX")"
+    tmp_aur="$(mktemp "$dir/.packages-aur.XXXXXX")"
+    if pacman -Qqe >"$tmp_exp" && pacman -Qqm >"$tmp_aur"; then
+      mv -f "$tmp_exp" "$dir/packages-explicit.txt"
+      mv -f "$tmp_aur" "$dir/packages-aur.txt"
+      ok "packages: $(wc -l <"$dir/packages-explicit.txt") explicit, $(wc -l <"$dir/packages-aur.txt") foreign"
+    else
+      rm -f "$tmp_exp" "$tmp_aur"
+      drift "pacman query failed; package lists left unchanged"
+    fi
   else
     note "pacman missing; package lists not written"
   fi
 
   if [[ -f "$HOME_DIR/.config/mise/config.toml" ]]; then
-    cp "$HOME_DIR/.config/mise/config.toml" "$dir/mise-config.toml"
-    ok "mise config"
+    if has_secret "$HOME_DIR/.config/mise/config.toml"; then
+      note "mise config contains a token-like value; NOT snapshotted"
+    else
+      install -m 600 "$HOME_DIR/.config/mise/config.toml" "$dir/mise-config.toml"
+      ok "mise config"
+    fi
   else
     note "no mise config found"
   fi
 
   if [[ -f "$CODEX_CONFIG" ]]; then
-    if grep -qE 'gh[pousr]_[A-Za-z0-9]{20,}|github_pat_|sk-[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{20,}|xox[baprs]-' "$CODEX_CONFIG"; then
+    if has_secret "$CODEX_CONFIG"; then
       note "codex config contains a token-like value; NOT snapshotted"
     else
-      cp "$CODEX_CONFIG" "$dir/codex-config.toml"
-      chmod 644 "$dir/codex-config.toml"
+      install -m 600 "$CODEX_CONFIG" "$dir/codex-config.toml"
       ok "codex config"
     fi
   fi
@@ -1079,8 +1367,13 @@ snapshot_all() {
   ok "git identity"
 
   if [[ "$SELF" != "$REPO_DIR/agent-rules-setup" ]]; then
-    install -m 755 "$SELF" "$REPO_DIR/agent-rules-setup"
-    ok "script copied into $REPO_DIR"
+    local repo_script="$REPO_DIR/agent-rules-setup"
+    if [[ -f "$repo_script" ]] && { cmp -s "$SELF" "$repo_script" || [[ "$repo_script" -nt "$SELF" ]]; }; then
+      ok "script in $REPO_DIR is current"
+    else
+      install -m 755 "$SELF" "$repo_script"
+      ok "script copied into $REPO_DIR"
+    fi
   fi
 
   printf '\nSnapshot written to %s\n\n' "$dir"
@@ -1102,10 +1395,10 @@ snapshot_all() {
         paths+=(README.md)
       fi
       git -C "$REPO_DIR" add -- "${paths[@]}"
-      if git -C "$REPO_DIR" diff --cached --quiet; then
+      if git -C "$REPO_DIR" diff --cached --quiet -- "${paths[@]}"; then
         ok "snapshot unchanged; nothing to push"
       else
-        git -C "$REPO_DIR" commit -m "snapshot: $(date +%F) machine state" >/dev/null
+        git -C "$REPO_DIR" commit -m "snapshot: $(date +%F) machine state" -- "${paths[@]}" >/dev/null
         if git -C "$REPO_DIR" push; then
           fix "snapshot committed and pushed"
         else
@@ -1288,6 +1581,12 @@ if [[ "$BOOTSTRAP" -eq 1 ]]; then
   fi
 fi
 
+if [[ "$MODE" == "check" ]]; then
+  check_bootstrap_state
+elif [[ "$BOOTSTRAP" -eq 0 ]]; then
+  restore_bootstrap_files
+fi
+
 # -----------------------------------------------------------------------------
 # 0. Personal config from the snapshot (only files that are missing)
 # -----------------------------------------------------------------------------
@@ -1391,7 +1690,13 @@ RULE
 # -----------------------------------------------------------------------------
 # 2. Tools in ~/.local/bin
 # -----------------------------------------------------------------------------
-mkdir -p "$BIN"
+if [[ ! -d "$BIN" ]]; then
+  if [[ "$MODE" == "check" ]]; then
+    drift "$BIN missing"
+  else
+    mkdir -p "$BIN"
+  fi
+fi
 
 install_content "$BIN/codex-git" 755 1 "codex-git" <<'SH'
 #!/usr/bin/env bash
@@ -1641,6 +1946,7 @@ def main() -> int:
     # Fixed pattern: collaborative posts otherwise land in the co-author's folder.
     L.dirname_pattern = str(DIR)
 
+    DIR.mkdir(parents=True, exist_ok=True)
     known = {
         p.name.split("_UTC")[0]
         for p in DIR.iterdir()
@@ -1913,7 +2219,7 @@ ConditionPathExists=!%h/.local/state/instagram-paused
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/flock -n /tmp/pdm-clara-autodl.lock /usr/bin/python3 %h/.local/bin/pdm-clara-autodl
+ExecStart=/usr/bin/flock -n %t/pdm-clara-autodl.lock /usr/bin/python3 %h/.local/bin/pdm-clara-autodl
 UNIT
 
 install_content "$UNIT_DIR/pdm-clara-autodl.timer" 644 1 "pdm-clara-autodl.timer" <<'UNIT'
@@ -1938,7 +2244,7 @@ ConditionPathExists=!%h/.local/state/instagram-paused
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/flock -n /tmp/julie-autodl.lock %h/.local/bin/ig-download julie.tuzet --new-only --session ivan_esteban23
+ExecStart=/usr/bin/flock -n %t/julie-autodl.lock %h/.local/bin/ig-download julie.tuzet --new-only --session ivan_esteban23
 UNIT
 
 install_content "$UNIT_DIR/julie-autodl.timer" 644 1 "julie-autodl.timer" <<'UNIT'
@@ -2141,8 +2447,10 @@ if [[ "$ENABLE" -eq 1 ]] && have_systemd; then
       fi
     done
   fi
+elif [[ "$ENABLE" -eq 0 ]]; then
+  note "units not enabled (--no-enable)"
 else
-  note "systemd user bus unavailable or --no-enable: timers not touched"
+  drift "systemd user bus unavailable; units not enabled"
 fi
 
 # -----------------------------------------------------------------------------
@@ -2321,7 +2629,7 @@ fi
 # Runtime checks (--check)
 # -----------------------------------------------------------------------------
 check_runtime() {
-  local c
+  local c ghb
   for c in mise git tmux checkupdates python3 gh codex flock; do
     if command -v "$c" >/dev/null 2>&1; then
       ok "command: $c"
@@ -2370,10 +2678,14 @@ check_runtime() {
       drift "mise tool missing: codex"
     fi
   fi
-  if gh auth status >/dev/null 2>&1; then
-    ok "gh authenticated"
+  if ghb="$(gh_bin)"; then
+    if "$ghb" auth status >/dev/null 2>&1; then
+      ok "gh authenticated"
+    else
+      note "gh not authenticated (expected on a fresh restore)"
+    fi
   else
-    note "gh not authenticated (expected on a fresh restore)"
+    note "gh not runnable without the mise wrapper; apply installs both"
   fi
   if [[ -f "$CODEX_HOME/auth.json" ]]; then
     ok "codex authenticated"

@@ -22,13 +22,15 @@ agent-rules-setup --restore-guide
   - `codex-remote-control.service` — Codex mobile/browser access
   - `qoder-remote-control.service` — Qoder mobile/browser access
   - `gh-wrapper-watch.path` — restores the sandbox-safe `gh` wrapper whenever `omarchy-refresh-applications` rewrites it
+  - `gh-wrapper-repair.service` — oneshot worker started by that path
 - Codex: default sandbox stays `read-only`; `[sandbox_workspace_write] network_access = true`
 - mise global tool set from `snapshot/mise-config.toml`
 - `free-claude-code` via `uv tool install` when `uv` is available
 - git identity / signing settings and `allowed_signers` from the snapshot
 - personal config from `snapshot/config/` (only files that are missing): git aliases/ignore, starship, alacritty, Hypr bindings, Omarchy bar layout, fcitx5 profile + tray drop-in, GTK_IM_MODULE, Obsidian vault registry, VS Code settings, Qoder settings, Claude theme
+- mise config, codex config and SSH `allowed_signers` from the snapshot. Plain `agent-rules-setup` (no `--bootstrap`) creates them only when missing and keeps a differing local copy; `--bootstrap` restores the snapshot copy
 - Omarchy Tailscale feature: `tailscale` package, `tailscaled`, operator, Taildrop receive service, bar widget (browser login stays manual)
-- SSH access: `openssh`, `sshd` enabled, `ufw limit 22/tcp` staged (the firewall itself stays off so LAN services keep working). Password auth is turned off only once `~/.ssh/authorized_keys` holds a key; pass `--ssh-key=<file.pub>` to add the phone's key in the same run, and the hardening reverts if the key disappears
+- SSH access: `openssh`, `sshd` enabled, `ufw limit 22/tcp` staged (the firewall itself stays off so LAN services keep working). `.ssh` is kept at 700 and `authorized_keys` at 600 (`sshd` StrictModes otherwise rejects the key). Password auth is turned off only once `authorized_keys` holds a key whose material validates with `ssh-keygen -lf`; pass `--ssh-key=<file.pub>` to add the phone's key in the same run. The hardening reverts if no valid key remains, and after reloading the effective `sshd -T` is re-probed (a drop-in that still enables passwords is reported as drift)
 - Qoder CLI (`qodercli`) and Antigravity CLI (`agy`) when missing
 - all 30 Obsidian community plugins + their settings from `snapshot/obsidian/` (restored once the vault exists)
 - `~/.local/bin` on `PATH` in `.bash_profile` and `.bashrc`
@@ -87,7 +89,7 @@ agent-rules-setup --check
 agent-rules-setup --smoke
 ```
 
-`--smoke` starts a real Codex sandbox and checks DNS, `gh` API access, `git ls-remote`, and SSH commit signing.
+`--smoke` applies everything first, then starts a real Codex sandbox and checks DNS, `gh` API access, `git ls-remote`, and SSH commit signing.
 
 Sidecar tools:
 
@@ -148,9 +150,9 @@ Then back up separately:
 
 ```bash
 agent-rules-setup                 # apply / repair everything (safe to re-run)
-agent-rules-setup --check         # report drift only, exit 1 if anything is off
+agent-rules-setup --check         # report drift only; exit 1 if anything is off
 agent-rules-setup --lint          # bash -n + shellcheck (warnings) on the script
-agent-rules-setup --smoke         # real Codex sandbox git/gh/signing test
+agent-rules-setup --smoke         # apply, then real Codex sandbox git/gh/signing test
 agent-rules-setup --install-packages  # reinstall every snapshotted pacman + AUR package
 agent-rules-setup --restore-guide # full reinstall runbook
 agent-rules-setup --snapshot --push  # refresh snapshot/ and push it
@@ -158,7 +160,23 @@ agent-rules-setup --pause-ig      # skip hourly Instagram downloads (timers stay
 agent-rules-setup --resume-ig     # clear the pause marker
 ```
 
+Exit codes: `0` everything in place, `1` drift/problems remain, `2` invalid flag combination (for example `--check --snapshot`, `--pause-ig --resume-ig`, or `--push` without `--snapshot`).
+
+`--check` is read-only: it performs no writes, no `mkdir`, no `chmod` and no network calls. It may run non-mutating `sudo` probes (`sshd -T`, `ufw show added`, file tests). A second plain apply reports `apply: 0 change(s)`.
+
+`--no-enable` installs files but leaves every service alone: user units/timers, `sshd`, `tailscaled`, Taildrop, the Tailscale operator and linger.
+
 The Instagram pause is a marker file (`~/.local/state/instagram-paused`) checked by both download services, so the timers keep their schedule and a normal apply cannot silently resume the downloads. Remove the marker with `--resume-ig`.
+
+## Snapshot hygiene
+
+`--snapshot` (often via `--pre-reset`) keeps the repo truthful:
+
+- personal configs under `snapshot/config/` that are no longer in the manifest are deleted, so deleted configs cannot resurrect;
+- Obsidian plugin folders that no longer exist in the vault are pruned, but only when the vault is present and readable and at least one plugin was scanned (a detached vault never wipes the snapshot);
+- any file matching a token pattern — `ghp_`/`github_pat_`, `sk-…` (`sk-proj-`, `sk-ant-`), `AIza…`, `xox…`, `tvly-…`, AWS `AKIA`/`ASIA`, private keys, or `KEY|TOKEN|SECRET=…` assignments — is skipped, including the mise and codex configs (stored mode 600);
+- package lists are written to temp files and moved only on success, so a failed `pacman` query cannot truncate them;
+- `--push` stages and commits only `agent-rules-setup`, `snapshot/` and `README.md` (pathspec), so unrelated staged files stay out of the snapshot commit.
 
 ## Why Codex PRs used to fail
 
