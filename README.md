@@ -78,7 +78,7 @@ For Instagram, log into instagram.com in Firefox and prime the saved session onc
 ig-download pdm.clara --new-only --cookies firefox
 ```
 
-The hourly timers reuse that saved session afterwards. (Both Instagram timers share session `ivan_esteban23`, so their hits add up against the same rate limit.)
+The hourly timers reuse that saved session afterwards. (Both Instagram timers share session `ivan_esteban23`, so their hits add up against the same rate limit.) When Instagram rate-limits the session, `agent-rules-setup --pause-ig` skips the downloads while leaving the timers enabled; `--resume-ig` clears the pause. `--check` reports the pause as a note, not drift.
 
 Verify:
 
@@ -154,7 +154,11 @@ agent-rules-setup --smoke         # real Codex sandbox git/gh/signing test
 agent-rules-setup --install-packages  # reinstall every snapshotted pacman + AUR package
 agent-rules-setup --restore-guide # full reinstall runbook
 agent-rules-setup --snapshot --push  # refresh snapshot/ and push it
+agent-rules-setup --pause-ig      # skip hourly Instagram downloads (timers stay enabled)
+agent-rules-setup --resume-ig     # clear the pause marker
 ```
+
+The Instagram pause is a marker file (`~/.local/state/instagram-paused`) checked by both download services, so the timers keep their schedule and a normal apply cannot silently resume the downloads. Remove the marker with `--resume-ig`.
 
 ## Why Codex PRs used to fail
 

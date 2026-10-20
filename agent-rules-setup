@@ -66,6 +66,8 @@
 #   agent-rules-setup --check         report drift only, change nothing (exit 1)
 #   agent-rules-setup --lint          bash -n + shellcheck (warnings) on this script
 #   agent-rules-setup --repair-gh     reinstall just the gh wrapper (watch unit)
+#   agent-rules-setup --pause-ig      skip hourly Instagram downloads (timers stay enabled)
+#   agent-rules-setup --resume-ig     clear the Instagram pause marker
 #   agent-rules-setup --force         also overwrite the AGENTS.md / GEMINI.md files
 #   agent-rules-setup --no-enable     install files but do not touch systemd
 #   agent-rules-setup --smoke         after applying, run a real sandbox git/gh test
@@ -129,6 +131,8 @@ PRE_RESET=0
 PACKAGES_ONLY=0
 LINT=0
 REPAIR_GH=0
+PAUSE_IG=0
+RESUME_IG=0
 SSH_KEY=""
 
 usage() {
@@ -152,6 +156,8 @@ while [[ $# -gt 0 ]]; do
     --install-packages) PACKAGES_ONLY=1; shift ;;
     --lint)           LINT=1; shift ;;
     --repair-gh)      REPAIR_GH=1; shift ;;
+    --pause-ig)       PAUSE_IG=1; shift ;;
+    --resume-ig)      RESUME_IG=1; shift ;;
     --ssh-key=*)      SSH_KEY="${1#*=}"; shift ;;
     --ssh-key)        SSH_KEY="${2:?--ssh-key needs a file}"; shift 2 ;;
     -h|--help)        usage; exit 0 ;;
@@ -173,6 +179,8 @@ CODEX_HOME="${CODEX_HOME:-$HOME_DIR/.codex}"
 CODEX_CONFIG="$CODEX_HOME/config.toml"
 OBSIDIAN_VAULT="${OBSIDIAN_VAULT:-$HOME_DIR/Documents/Obsidian Vault}"
 TIMERS=(pdm-clara-autodl.timer julie-autodl.timer system-update-check.timer)
+IG_TIMERS=(pdm-clara-autodl.timer julie-autodl.timer)
+IG_PAUSE_MARKER="$HOME_DIR/.local/state/instagram-paused"
 SERVICES=(codex-remote-control.service qoder-remote-control.service)
 WATCH_UNITS=(gh-wrapper-watch.path)
 
@@ -271,6 +279,21 @@ SH
 if [[ "$REPAIR_GH" -eq 1 ]]; then
   MODE="apply"
   install_gh_wrapper
+  exit 0
+fi
+
+if (( PAUSE_IG || RESUME_IG )); then
+  if [[ "$MODE" == "check" ]]; then
+    die "--pause-ig/--resume-ig cannot be combined with --check"
+  fi
+  if (( PAUSE_IG )); then
+    mkdir -p "$(dirname "$IG_PAUSE_MARKER")"
+    : >"$IG_PAUSE_MARKER"
+    fix "Instagram timers paused ($IG_PAUSE_MARKER); --resume-ig re-enables downloads"
+  else
+    rm -f "$IG_PAUSE_MARKER"
+    fix "Instagram timers resumed; the next hourly elapse downloads again"
+  fi
   exit 0
 fi
 
@@ -1886,6 +1909,7 @@ install_self
 install_content "$UNIT_DIR/pdm-clara-autodl.service" 644 1 "pdm-clara-autodl.service" <<'UNIT'
 [Unit]
 Description=Download new pdm.clara Instagram posts (images only)
+ConditionPathExists=!%h/.local/state/instagram-paused
 
 [Service]
 Type=oneshot
@@ -1910,6 +1934,7 @@ pdm_timer_changed=$LAST_CHANGED
 install_content "$UNIT_DIR/julie-autodl.service" 644 1 "julie-autodl.service" <<'UNIT'
 [Unit]
 Description=Download new julie.tuzet Instagram posts (images only)
+ConditionPathExists=!%h/.local/state/instagram-paused
 
 [Service]
 Type=oneshot
@@ -2010,6 +2035,16 @@ UNIT
 
 have_systemd() { systemctl --user show-environment >/dev/null 2>&1; }
 
+# Prints "ActiveState|SubState|NextElapseUSecRealtime" for a timer.
+timer_probe() {
+  local snap
+  snap="$(systemctl --user show -p ActiveState -p SubState -p NextElapseUSecRealtime "$1" 2>/dev/null || true)"
+  printf '%s|%s|%s\n' \
+    "$(awk -F= '$1 == "ActiveState" {print $2}' <<<"$snap")" \
+    "$(awk -F= '$1 == "SubState" {print $2}' <<<"$snap")" \
+    "$(awk -F= '$1 == "NextElapseUSecRealtime" {print $2}' <<<"$snap")"
+}
+
 if [[ "$ENABLE" -eq 1 ]] && have_systemd; then
   if [[ "$MODE" == "apply" ]]; then
     systemctl --user daemon-reload
@@ -2025,10 +2060,14 @@ if [[ "$ENABLE" -eq 1 ]] && have_systemd; then
         if [[ "$tc" -eq 1 ]]; then
           systemctl --user try-restart "$t" >/dev/null 2>&1 || true
         fi
+        tag=""
+        if [[ -e "$IG_PAUSE_MARKER" && " ${IG_TIMERS[*]} " == *" $t "* ]]; then
+          tag=" (IG paused)"
+        fi
         if [[ "$was" == "enabled" ]]; then
-          ok "$t enabled"
+          ok "$t enabled$tag"
         else
-          fix "$t enabled"
+          fix "$t enabled$tag"
         fi
       else
         drift "$t could not be enabled"
@@ -2061,12 +2100,27 @@ if [[ "$ENABLE" -eq 1 ]] && have_systemd; then
   else
     for t in "${TIMERS[@]}"; do
       state="$(systemctl --user is-enabled "$t" 2>/dev/null || true)"
-      active="$(systemctl --user is-active "$t" 2>/dev/null || true)"
-      next="$(systemctl --user show -p NextElapseUSecRealtime --value "$t" 2>/dev/null || true)"
+      IFS='|' read -r active sub next <<<"$(timer_probe "$t")"
+      if [[ -e "$IG_PAUSE_MARKER" && " ${IG_TIMERS[*]} " == *" $t "* ]]; then
+        if [[ "$state" == "enabled" && "$active" == "active" ]]; then
+          note "$t paused (Instagram downloads paused; --resume-ig)"
+        else
+          drift "$t not running while paused (enabled=$state active=$active)"
+        fi
+        continue
+      fi
+      if [[ "$state" == "enabled" && "$active" == "active" && -n "$next" && "$next" != "0" ]]; then
+        ok "$t ($next)"
+        continue
+      fi
+      # systemd recomputes the next elapse right around a trigger; re-sample
+      # once so a just-fired timer is not reported as stuck.
+      sleep 2
+      IFS='|' read -r active sub next <<<"$(timer_probe "$t")"
       if [[ "$state" == "enabled" && "$active" == "active" && -n "$next" && "$next" != "0" ]]; then
         ok "$t ($next)"
       else
-        drift "$t (enabled=$state active=$active next=${next:-none})"
+        drift "$t (enabled=$state active=$active sub=${sub:-none} next=${next:-none})"
       fi
     done
     for s in "${SERVICES[@]}"; do
