@@ -1,0 +1,4 @@
+epson-inkjet-printer-escpr
+instaloader
+python-browser-cookie3
+ttf-ms-fonts

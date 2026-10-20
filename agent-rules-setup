@@ -1,0 +1,1410 @@
+#!/usr/bin/env bash
+# =============================================================================
+# agent-rules-setup — provision and lint this machine's agent rules + fixes
+#
+# Idempotent. Run OUTSIDE the Codex sandbox (the sandbox cannot write $HOME).
+#
+# What this installs / repairs:
+#   1. Rule files (written only when missing, or with --force)
+#        ~/AGENTS.md           autonomy / no-confirmation rules
+#        ~/.qoder/AGENTS.md    Instagram, download monitoring, update checks,
+#                              account timers, Codex sandbox rules
+#        ~/.codex/AGENTS.md    end-of-task GitHub sync rule
+#   2. Tools in ~/.local/bin
+#        ig-download           images-only Instagram archiver, metadata cleanup
+#        download-monitor      tmux/log progress monitor for downloads
+#        pdm-clara-autodl      hourly pdm.clara poller
+#        system-update-check   pacman + AUR pending-update counter
+#        codex-git             Codex with workspace-write + network + GH_TOKEN
+#        gh                    fixed wrapper: falls back to the mise shim when
+#                              the filesystem is read-only (Codex sandbox)
+#   3. systemd --user timers
+#        pdm-clara-autodl.timer     hourly, RemainAfterElapse=no
+#        julie-autodl.timer         hourly, RemainAfterElapse=no   (fixed)
+#        system-update-check.timer  every 3h, calendar-based       (fixed)
+#      The old OnBootSec/OnUnitActiveSec pair can wedge at next_elapse=0
+#      after a failed run; OnCalendar + RemainAfterElapse=no cannot.
+#   4. ~/.codex/config.toml
+#        sandbox_mode stays "read-only"; [sandbox_workspace_write] gets
+#        network_access = true so codex-git and PR work have DNS + HTTPS.
+#
+# Why Codex used to block PR completion:
+#   * default read-only sandbox has no DNS/network -> gh and git push fail
+#   * no GH_TOKEN inside the sandbox -> gh treats the keyring token as invalid
+#   * login shells re-prepend ~/.local/bin, so `gh` hit the auto-update wrapper,
+#     which runs `mise use -g` and exits on the read-only filesystem
+#   Fixes: codex-git (workspace-write + network + GH_TOKEN + mise shims) and
+#   the gh wrapper's read-only fallback. SSH commit signing works in-sandbox.
+#
+# Usage:
+#   agent-rules-setup                 apply everything (safe to re-run)
+#   agent-rules-setup --check         report drift only, change nothing (exit 1)
+#   agent-rules-setup --force         also overwrite the three AGENTS.md files
+#   agent-rules-setup --no-enable     install files but do not touch systemd
+#   agent-rules-setup --smoke         after applying, run a real sandbox git/gh test
+#
+# Recovery on a fresh Omarchy install (mise is part of Omarchy; it is not
+# reinstalled here):
+#   ./agent-rules-setup --bootstrap                 deps + tools + configs + apply
+#   ./agent-rules-setup --bootstrap --minimal       only gh + codex (skip full mise set)
+#   ./agent-rules-setup --bootstrap --with-packages reinstall the snapshotted
+#                                                   pacman/AUR package lists too
+#   ./agent-rules-setup --snapshot                  refresh snapshot/ from this machine
+#   ./agent-rules-setup --snapshot --push           snapshot, commit, and push the repo
+#
+# NOT included (never commit these; restore from a secure backup):
+#   ~/.ssh/id_ed25519_signing   private signing key
+#   ~/.codex/auth.json          Codex login
+#   ~/.config/instaloader/session-*  Instagram session
+#   ~/Downloads, ~/Work, ~/Documents/Obsidian Vault
+# After restoring, log in again: gh auth login && gh auth setup-git; codex login;
+# log into instagram.com in Firefox and run ig-download ... --cookies firefox.
+# =============================================================================
+
+set -euo pipefail
+
+MODE="apply"
+FORCE=0
+ENABLE=1
+SMOKE=0
+BOOTSTRAP=0
+WITH_PACKAGES=0
+MINIMAL=0
+SNAPSHOT_MODE=0
+PUSH=0
+
+usage() {
+  awk 'f && /^# ={20,}$/ {exit} /^# Usage:/{f=1} f {sub(/^# ?/, ""); print}' "$0"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --check)          MODE="check"; shift ;;
+    --apply)          MODE="apply"; shift ;;
+    --force)          FORCE=1; shift ;;
+    --no-enable)      ENABLE=0; shift ;;
+    --smoke)          SMOKE=1; shift ;;
+    --bootstrap)      BOOTSTRAP=1; shift ;;
+    --with-packages)  WITH_PACKAGES=1; shift ;;
+    --minimal)        MINIMAL=1; shift ;;
+    --snapshot)       SNAPSHOT_MODE=1; shift ;;
+    --push)           PUSH=1; shift ;;
+    -h|--help)        usage; exit 0 ;;
+    *) echo "unknown option: $1" >&2; exit 2 ;;
+  esac
+done
+
+HOME_DIR="${HOME:?HOME is not set}"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+REPO_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+SNAPSHOT_DIR="$REPO_DIR/snapshot"
+BIN="$HOME_DIR/.local/bin"
+UNIT_DIR="$HOME_DIR/.config/systemd/user"
+CODEX_HOME="${CODEX_HOME:-$HOME_DIR/.codex}"
+CODEX_CONFIG="$CODEX_HOME/config.toml"
+TIMERS=(pdm-clara-autodl.timer julie-autodl.timer system-update-check.timer)
+
+changes=0
+problems=0
+LAST_CHANGED=0
+
+ok()    { printf '  ok    %s\n' "$*"; }
+fix()   { printf '  fix   %s\n' "$*"; changes=$((changes + 1)); }
+drift() { printf '  drift %s\n' "$*"; problems=$((problems + 1)); }
+note()  { printf '  note  %s\n' "$*"; }
+die()   { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+# install_content PATH MODE FORCE_OK LABEL  (content on stdin)
+install_content() {
+  local path="$1" mode="$2" force_ok="$3" label="$4"
+  local tmp
+  LAST_CHANGED=0
+  tmp="$(mktemp)"
+  cat >"$tmp"
+
+  if [[ -f "$path" ]] && cmp -s "$tmp" "$path"; then
+    chmod "$mode" "$path" 2>/dev/null || true
+    ok "$label"
+    rm -f "$tmp"
+    return 0
+  fi
+
+  if [[ "$MODE" == "check" ]]; then
+    if [[ -f "$path" ]]; then
+      drift "$label (out of date)"
+    else
+      drift "$label (missing)"
+    fi
+    rm -f "$tmp"
+    return 0
+  fi
+
+  if [[ -f "$path" && "$force_ok" -ne 1 ]]; then
+    note "$label (exists, left untouched; --force to overwrite)"
+    rm -f "$tmp"
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$path")"
+  if [[ -f "$path" && ! -e "$path.bak-agent-rules" ]]; then
+    cp -p "$path" "$path.bak-agent-rules"
+  fi
+  install -m "$mode" "$tmp" "$path"
+  LAST_CHANGED=1
+  fix "$label"
+  rm -f "$tmp"
+}
+
+install_self() {
+  if [[ "$SELF" == "$BIN/agent-rules-setup" ]]; then
+    ok "agent-rules-setup"
+    return 0
+  fi
+  install_content "$BIN/agent-rules-setup" 755 1 "agent-rules-setup" <"$SELF"
+}
+
+# -----------------------------------------------------------------------------
+# Recovery helpers — Omarchy ships mise in the base image, so it is assumed
+# -----------------------------------------------------------------------------
+sudo_n() { sudo -n "$@"; }
+
+ensure_pkgs() {
+  local missing=() p
+  for p in "$@"; do
+    if ! pacman -Q "$p" >/dev/null 2>&1; then
+      missing+=("$p")
+    fi
+  done
+  if (( ${#missing[@]} == 0 )); then
+    ok "packages: $*"
+    return 0
+  fi
+  if [[ "$MODE" == "check" ]]; then
+    drift "packages missing: ${missing[*]}"
+    return 0
+  fi
+  if ! command -v pacman >/dev/null 2>&1; then
+    die "pacman not found; this recovery kit targets Omarchy/Arch"
+  fi
+  if sudo_n pacman -S --needed --noconfirm "${missing[@]}"; then
+    fix "packages installed: ${missing[*]}"
+  else
+    drift "package install failed: ${missing[*]}"
+  fi
+}
+
+ensure_aur() {
+  local p
+  for p in "$@"; do
+    if pacman -Q "$p" >/dev/null 2>&1; then
+      ok "AUR package: $p"
+      continue
+    fi
+    if [[ "$MODE" == "check" ]]; then
+      drift "AUR package missing: $p"
+      continue
+    fi
+    if ! command -v yay >/dev/null 2>&1; then
+      drift "yay missing; cannot install $p"
+      continue
+    fi
+    if yay -S --needed --noconfirm "$p"; then
+      fix "AUR package installed: $p"
+    else
+      drift "AUR install failed: $p"
+    fi
+  done
+}
+
+backup_once() {
+  local dest="$1"
+  if [[ -f "$dest" && ! -e "$dest.bak-agent-rules" ]]; then
+    cp -p "$dest" "$dest.bak-agent-rules"
+  fi
+}
+
+restore_file() {
+  local src="$1" dest="$2" mode="$3" label="$4"
+  if [[ ! -f "$src" ]]; then
+    return 0
+  fi
+  if [[ -f "$dest" ]] && cmp -s "$src" "$dest"; then
+    ok "$label"
+    return 0
+  fi
+  if [[ "$MODE" == "check" ]]; then
+    ok "$label"
+    return 0
+  fi
+  mkdir -p "$(dirname "$dest")"
+  backup_once "$dest"
+  install -m "$mode" "$src" "$dest"
+  fix "$label"
+}
+
+read_snap() {
+  if [[ -s "$1" ]]; then
+    head -1 "$1"
+  fi
+}
+
+ensure_path_block() {
+  local file="$1"
+  if [[ -f "$file" ]] && grep -q '# >>> agent-rules PATH >>>' "$file"; then
+    ok "PATH block: $file"
+    return 0
+  fi
+  if [[ "$MODE" == "check" ]]; then
+    drift "PATH block missing: $file"
+    return 0
+  fi
+  mkdir -p "$(dirname "$file")"
+  touch "$file"
+  cat >>"$file" <<'EOF'
+
+# >>> agent-rules PATH >>>
+case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac
+# <<< agent-rules PATH <<<
+EOF
+  fix "PATH block: $file"
+}
+
+bootstrap_mise() {
+  if ! command -v mise >/dev/null 2>&1; then
+    die "mise not found; a fresh Omarchy install provides it (pacman -S mise-bin)"
+  fi
+  if (( MINIMAL )); then
+    if MISE_YES=1 mise use -g gh@latest codex@latest; then
+      fix "mise tools: gh, codex"
+    else
+      drift "mise tools: gh, codex"
+    fi
+    mise reshim >/dev/null 2>&1 || true
+    return 0
+  fi
+  restore_file "$SNAPSHOT_DIR/mise-config.toml" "$HOME_DIR/.config/mise/config.toml" 644 "mise config"
+  if MISE_YES=1 mise install; then
+    fix "mise install"
+  else
+    drift "mise install (some tools failed)"
+  fi
+  mise reshim >/dev/null 2>&1 || true
+}
+
+bootstrap_configs() {
+  restore_file "$SNAPSHOT_DIR/codex-config.toml" "$CODEX_HOME/config.toml" 600 "codex config"
+  restore_file "$SNAPSHOT_DIR/allowed_signers" "$HOME_DIR/.ssh/allowed_signers" 644 "SSH allowed signers"
+}
+
+git_set_if_empty() {
+  local key="$1" val="$2"
+  if [[ -z "$val" ]]; then
+    return 0
+  fi
+  if [[ -n "$(git config --global --get "$key" 2>/dev/null || true)" ]]; then
+    ok "git $key"
+    return 0
+  fi
+  if [[ "$MODE" == "check" ]]; then
+    drift "git $key not set"
+    return 0
+  fi
+  git config --global "$key" "$val"
+  fix "git $key"
+}
+
+bootstrap_git() {
+  local name email skey sfmt sadd keyfile
+  name=$(read_snap "$SNAPSHOT_DIR/git-user-name")
+  email=$(read_snap "$SNAPSHOT_DIR/git-user-email")
+  skey=$(read_snap "$SNAPSHOT_DIR/git-signing-key")
+  sfmt=$(read_snap "$SNAPSHOT_DIR/git-signing-format")
+  sadd=$(read_snap "$SNAPSHOT_DIR/git-allowed-signers")
+
+  git_set_if_empty user.name "$name"
+  git_set_if_empty user.email "$email"
+
+  keyfile="$skey"
+  if [[ -n "$keyfile" && ! -f "$keyfile" ]]; then
+    keyfile="${skey%.pub}"
+  fi
+  if [[ -n "$skey" && -f "$keyfile" ]]; then
+    local signing_value="$skey"
+    if [[ ! -f "$signing_value" ]]; then
+      signing_value="$keyfile"
+    fi
+    git_set_if_empty gpg.format "${sfmt:-ssh}"
+    git_set_if_empty user.signingkey "$signing_value"
+    git_set_if_empty gpg.ssh.allowedSignersFile "${sadd:-$HOME_DIR/.ssh/allowed_signers}"
+    git_set_if_empty commit.gpgsign true
+    git_set_if_empty tag.gpgsign true
+    ok "commit signing configured"
+  else
+    note "private signing key missing (${skey:-~/.ssh/id_ed25519_signing}); signing left off"
+    note "restore it from secure backup, then rerun --bootstrap (never commit it)"
+  fi
+
+  if gh auth status >/dev/null 2>&1; then
+    if [[ -n "$(git config --global --get-all credential.https://github.com.helper 2>/dev/null | tr -d '[:space:]')" ]]; then
+      ok "git credential helper"
+    elif gh auth setup-git >/dev/null 2>&1; then
+      fix "git credential helper (gh)"
+    else
+      note "gh auth setup-git failed"
+    fi
+  else
+    note "gh not authenticated: run 'gh auth login && gh auth setup-git' after bootstrap"
+  fi
+}
+
+bootstrap_linger() {
+  local linger
+  linger=$(loginctl show-user "$USER" -p Linger 2>/dev/null || true)
+  if [[ "$linger" == "Linger=yes" ]]; then
+    ok "linger enabled"
+    return 0
+  fi
+  if [[ "$MODE" == "check" ]]; then
+    drift "linger disabled (timers stop at logout)"
+    return 0
+  fi
+  if sudo_n loginctl enable-linger "$USER"; then
+    fix "linger enabled"
+  else
+    drift "could not enable linger"
+  fi
+}
+
+bootstrap_packages() {
+  local exp="$SNAPSHOT_DIR/packages-explicit.txt" aur="$SNAPSHOT_DIR/packages-aur.txt"
+  if [[ -s "$exp" ]]; then
+    if xargs -r -n 50 sudo -n pacman -S --needed --noconfirm <"$exp"; then
+      fix "explicit package list restored"
+    else
+      drift "some explicit packages failed (see pacman output)"
+    fi
+  else
+    note "no explicit package snapshot"
+  fi
+  if [[ -s "$aur" ]]; then
+    if command -v yay >/dev/null 2>&1; then
+      if xargs -r -n 30 yay -S --needed --noconfirm <"$aur"; then
+        fix "AUR package list restored"
+      else
+        drift "some AUR packages failed (see yay output)"
+      fi
+    else
+      note "yay missing; AUR package list skipped"
+    fi
+  fi
+}
+
+bootstrap_all() {
+  local id=""
+  if [[ -r /etc/os-release ]]; then
+    id=$(. /etc/os-release; printf '%s' "${ID:-}")
+  fi
+  if [[ "$id" != "omarchy" && "$id" != "arch" ]]; then
+    note "platform id='${id:-unknown}' (expected omarchy/arch)"
+  fi
+
+  ensure_pkgs pacman-contrib tmux libnotify yay
+  ensure_aur instaloader
+  bootstrap_mise
+  bootstrap_configs
+  bootstrap_git
+  ensure_path_block "$HOME_DIR/.bash_profile"
+  ensure_path_block "$HOME_DIR/.bashrc"
+  bootstrap_linger
+
+  if (( WITH_PACKAGES )); then
+    bootstrap_packages
+  else
+    note "run with --with-packages to reinstall the snapshotted pacman/AUR lists"
+  fi
+}
+
+snapshot_all() {
+  local dir="$SNAPSHOT_DIR"
+  mkdir -p "$dir"
+
+  if command -v pacman >/dev/null 2>&1; then
+    pacman -Qqe >"$dir/packages-explicit.txt"
+    pacman -Qqm >"$dir/packages-aur.txt"
+    ok "packages: $(wc -l <"$dir/packages-explicit.txt") explicit, $(wc -l <"$dir/packages-aur.txt") foreign"
+  else
+    note "pacman missing; package lists not written"
+  fi
+
+  if [[ -f "$HOME_DIR/.config/mise/config.toml" ]]; then
+    cp "$HOME_DIR/.config/mise/config.toml" "$dir/mise-config.toml"
+    ok "mise config"
+  else
+    note "no mise config found"
+  fi
+
+  if [[ -f "$CODEX_CONFIG" ]]; then
+    if grep -qE 'gh[pousr]_[A-Za-z0-9]{20,}|github_pat_|sk-[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{20,}|xox[baprs]-' "$CODEX_CONFIG"; then
+      note "codex config contains a token-like value; NOT snapshotted"
+    else
+      cp "$CODEX_CONFIG" "$dir/codex-config.toml"
+      chmod 644 "$dir/codex-config.toml"
+      ok "codex config"
+    fi
+  fi
+
+  if [[ -f "$HOME_DIR/.ssh/allowed_signers" ]]; then
+    cp "$HOME_DIR/.ssh/allowed_signers" "$dir/allowed_signers"
+    ok "SSH allowed signers"
+  fi
+
+  git config --global --get user.name >"$dir/git-user-name" 2>/dev/null || :
+  git config --global --get user.email >"$dir/git-user-email" 2>/dev/null || :
+  git config --global --get user.signingkey >"$dir/git-signing-key" 2>/dev/null || :
+  git config --global --get gpg.format >"$dir/git-signing-format" 2>/dev/null || :
+  git config --global --get gpg.ssh.allowedSignersFile >"$dir/git-allowed-signers" 2>/dev/null || :
+  ok "git identity"
+
+  if [[ "$SELF" != "$REPO_DIR/agent-rules-setup" ]]; then
+    install -m 755 "$SELF" "$REPO_DIR/agent-rules-setup"
+    ok "script copied into $REPO_DIR"
+  fi
+
+  printf '\nSnapshot written to %s\n\n' "$dir"
+  printf 'Back these up separately — never commit them:\n'
+  printf '  ~/.ssh/id_ed25519_signing        private signing key\n'
+  printf '  ~/.codex/auth.json               Codex login\n'
+  printf '  ~/.config/instaloader/session-*  Instagram session\n'
+  printf '  ~/Downloads, ~/Work, ~/Documents/Obsidian Vault\n'
+
+  if (( PUSH )); then
+    if [[ -d "$REPO_DIR/.git" ]]; then
+      local paths=(agent-rules-setup snapshot)
+      if [[ -f "$REPO_DIR/README.md" ]]; then
+        paths+=(README.md)
+      fi
+      git -C "$REPO_DIR" add -- "${paths[@]}"
+      if git -C "$REPO_DIR" diff --cached --quiet; then
+        ok "snapshot unchanged; nothing to push"
+      else
+        git -C "$REPO_DIR" commit -m "snapshot: $(date +%F) machine state" >/dev/null
+        if git -C "$REPO_DIR" push; then
+          fix "snapshot committed and pushed"
+        else
+          drift "git push failed (snapshot is still local)"
+        fi
+      fi
+    else
+      note "$REPO_DIR is not a git repo; snapshot not pushed"
+    fi
+  fi
+}
+
+print_post_restore() {
+  printf '\nPost-restore, log in again (interactive):\n'
+  if ! gh auth status >/dev/null 2>&1; then
+    printf '  gh auth login && gh auth setup-git\n'
+  else
+    printf '  gh auth: already authenticated\n'
+  fi
+  if [[ ! -f "$CODEX_HOME/auth.json" ]]; then
+    printf '  codex login\n'
+  else
+    printf '  codex: already authenticated\n'
+  fi
+  if [[ ! -f "$HOME_DIR/.config/instaloader/session-ivan_esteban23" ]]; then
+    printf '  log into instagram.com in Firefox, then:\n'
+    printf '    ig-download pdm.clara --new-only --cookies firefox\n'
+  fi
+  printf '  restore personal data (Downloads, Work, Obsidian Vault) from backup\n'
+  printf '  verify: agent-rules-setup --check  then  agent-rules-setup --smoke\n'
+}
+
+# -----------------------------------------------------------------------------
+# Snapshot / bootstrap entry points
+# -----------------------------------------------------------------------------
+if [[ "$SNAPSHOT_MODE" -eq 1 ]]; then
+  snapshot_all
+  if (( problems > 0 )); then
+    exit 1
+  fi
+  exit 0
+fi
+
+if [[ "$BOOTSTRAP" -eq 1 ]]; then
+  if [[ "$MODE" == "check" ]]; then
+    note "--bootstrap ignored with --check; checking installed state instead"
+  else
+    bootstrap_all
+  fi
+fi
+
+# -----------------------------------------------------------------------------
+# 1. Rule files (never clobber local annotations unless --force)
+# -----------------------------------------------------------------------------
+install_rule() {
+  local path="$1" label="$2"
+  # Existing rule files may carry local annotations: only replace with --force.
+  if [[ -s "$path" && ( "$FORCE" -ne 1 || "$MODE" == "check" ) ]]; then
+    ok "$label"
+    return 0
+  fi
+  install_content "$path" 644 1 "$label"
+}
+install_rule "$HOME_DIR/AGENTS.md" "~/AGENTS.md" <<'RULE'
+# Autonomous Execution & Permission Rules
+
+- **Do Not Ask For Permission To Proceed**: The user has authorized all commands, scripts, tools, file modifications, and installations on this system.
+- **Direct Execution**: Always execute commands, file creations, and edits directly. Never prompt the user for confirmation or ask if you should proceed with routine or necessary operations.
+- **Proactive Problem Solving**: When a command or task needs to be performed to accomplish the user's objective, run it immediately.
+RULE
+
+install_rule "$HOME_DIR/.qoder/AGENTS.md" "~/.qoder/AGENTS.md" <<'RULE'
+# Instagram downloads (instaloader)
+
+General tool for any account: `ig-download` (`~/.local/bin/ig-download`).
+Usage: `ig-download <account> [-n N | --all] [--new-only] [--session USER | --login USER] [--cookiefile PATH]`.
+Default login is browser cookies (`--cookies firefox`); alternatives are `--session USER` (saved session) and `--login USER` (interactive). It always downloads images only, skips posts already on disk, and removes metadata on exit.
+
+After downloading Instagram posts for any user with instaloader:
+1. Download images only, never videos — always disable video downloads (instaloader `--no-videos` / `download_videos=False`).
+2. Delete all `.txt` caption files and `.json.xz` metadata files in the target download folder.
+3. Keep only image files (.jpg/.jpeg/.png/.webp).
+Do all of this automatically at the start/end of every Instagram download task, without being asked.
+
+# Download monitoring
+
+Whenever a download task starts (ig-download, instaloader batches, timers), run it in tmux when long and set up background monitoring. Report progress milestones (roughly every 20 posts or 20%), any errors or rate-limit pauses, and the final result (posts/images added, cleanup status). Never leave a download running unmonitored.
+
+# System update checks
+
+Check for pending system updates every 3 hours using `system-update-check` (user-level systemd timer `system-update-check.timer`; log at `~/.local/state/system-update-check.log`). Report pacman and AUR counts; show package lists when asked. Never install or upgrade packages automatically — only when the user explicitly asks.
+
+# Autonomy and confirmations
+
+The user has passwordless sudo enabled and does not want confirmation prompts before actions on this machine or their GitHub account. For any requested task, proceed without asking:
+- system changes: package install/upgrade/removal, configuration edits, services/timers, firewall rules, etc. (`sudo -n` works without a password)
+- GitHub operations: commits, pushes, branches, PRs, issues, workflow runs (via `gh`)
+Only pause if credentials/2FA are required or the request itself is ambiguous.
+
+# Instagram account monitoring
+
+New posts are downloaded automatically by user-level systemd timers (hourly, images only, metadata removed afterward):
+- pdm.clara → `pdm-clara-autodl.timer` (saved session)
+- julie.tuzet → `julie-autodl.timer` (runs `ig-download julie.tuzet --new-only --session ivan_esteban23`)
+
+Keep these timers enabled unless the user says otherwise. To add another account, create a matching service/timer pair using `ig-download <account> --new-only --session ivan_esteban23`.
+Both timers poll the same session `ivan_esteban23`, so their hourly hits add up against one account. katarinabluu is manual-only (no timer); pull it with `ig-download katarinabluu --session ivan_esteban23` in tmux, in batches, when asked.
+
+Timer scheduling note: use `OnCalendar=hourly` + `RemainAfterElapse=no`. A monotonic `OnBootSec`/`OnUnitActiveSec` pair can end up with `next_elapse=0` after a failed run, leaving the timer `active (elapsed)` with no next fire until it is restarted.
+
+# Codex CLI sandbox (git/GitHub access)
+
+`~/.codex/config.toml` keeps `sandbox_mode = "read-only"` and gives `[sandbox_workspace_write]` network access. Use `codex-git` (`~/.local/bin/codex-git`) instead of bare `codex` for any task that needs to push or merge: it exports `GH_TOKEN` from the gh keyring and layers `-c sandbox_mode=workspace-write -c sandbox_workspace_write.network_access=true`. Repo writes and TMPDIR work; writes outside the workspace (e.g. `$HOME`) stay blocked. Verified: `gh api user`, `gh pr view`, `git ls-remote`, `git push`, SSH commit signing. Note `codex -p <profile> sandbox` loads the profile but ignores its `sandbox_mode`; only `-c` overrides take effect there.
+
+`~/.local/bin/gh` falls back to the mise shim when `mise use` cannot write (read-only sandbox), because login shells put `~/.local/bin` ahead of the shims.
+RULE
+
+install_rule "$CODEX_HOME/AGENTS.md" "~/.codex/AGENTS.md" <<'RULE'
+## Automatic GitHub sync for Ivan's projects
+
+Standing user instruction: after each completed task that changes project files in `/home/ivanaguilera/Work` or `/home/ivanaguilera/Documents/Obsidian Vault`, sync the completed changes to GitHub before the final response. Follow `/home/ivanaguilera/Work/github-project-sync/README.md` and its tested `sync.py` command. Existing targets are `ivan-esteban23/work-archive` and, for website commits, `ivan-esteban23/the-reference-edit`. This applies to Japan, Goth Rock, magazines, and other projects, including new projects in Work.
+
+Pass only the task's changed files/owned folders as repeated `--path` arguments, and only intentionally deleted files as `--delete`. Include changed dashboards, shared indexes, prompt notes and relevant attachments. For Notion edits, save fresh scoped readbacks/exports in the project Work directory before sync; local snapshots do not update themselves. For the website, create the normal verified commit first; sync does not replace deployment.
+
+Scoped commits and pushes to these existing targets are already authorized; do not ask the user again for conversational permission. Use required sandbox/network escalation normally. Preserve credential exclusions, user content, unrelated edits and Git history. Never force-push or claim success without the command's remote verification. If blocked/offline, retain local work and report the upload as pending. Apply this instruction to changed project content, not read-only questions or unrelated filesystem/system tasks. This is end-of-task sync, not a background watcher for external edits.
+RULE
+
+# -----------------------------------------------------------------------------
+# 2. Tools in ~/.local/bin
+# -----------------------------------------------------------------------------
+mkdir -p "$BIN"
+
+install_content "$BIN/codex-git" 755 1 "codex-git" <<'SH'
+#!/usr/bin/env bash
+# Run Codex with a workspace-write sandbox that has network access, and with
+# GH_TOKEN populated from the gh keyring so git/gh work inside the sandbox.
+# The default Codex sandbox is read-only with no network, which makes gh report
+# a valid token as invalid and blocks git push.
+set -euo pipefail
+
+# Prefer mise shims over the ~/.local/bin wrappers inside the sandbox: those
+# wrappers run `mise use`, which writes config and fails on a read-only fs.
+export PATH="$HOME/.local/share/mise/shims:$PATH"
+export MISE_MINIMUM_RELEASE_AGE=0
+
+if [ -z "${GH_TOKEN:-}" ]; then
+  if ! GH_TOKEN="$(gh auth token 2>/dev/null)"; then
+    GH_TOKEN="$("$HOME/.local/share/mise/shims/gh" auth token 2>/dev/null || true)"
+  fi
+  export GH_TOKEN
+fi
+
+exec codex \
+  -c sandbox_mode="workspace-write" \
+  -c sandbox_workspace_write.network_access=true \
+  -c shell_environment_policy.inherit=all \
+  "$@"
+SH
+
+install_content "$BIN/gh" 755 1 "gh (read-only fallback)" <<'SH'
+#!/bin/bash
+export MISE_MINIMUM_RELEASE_AGE=0
+if mise use -g --quiet "gh" 2>/dev/null; then
+  exec mise x "gh" -- "gh" "$@"
+fi
+# Read-only sandbox (/home is not writable): `mise use` cannot rewrite config.
+# Fall back to the already-installed shim so gh/git credential/PR work works.
+shim="$HOME/.local/share/mise/shims/gh"
+if [ -x "$shim" ]; then
+  exec "$shim" "$@"
+fi
+echo "gh: mise could not update and no mise shim exists" >&2
+exit 1
+SH
+
+install_content "$BIN/system-update-check" 755 1 "system-update-check" <<'SH'
+#!/usr/bin/env bash
+set -uo pipefail
+
+count_lines() { awk 'NF' | wc -l; }
+
+official=$(checkupdates 2>/dev/null || true)
+aur=$(yay -Qua 2>/dev/null || true)
+
+official_count=$(printf '%s' "$official" | count_lines)
+aur_count=$(printf '%s' "$aur" | count_lines)
+
+timestamp=$(date '+%Y-%m-%d %H:%M %Z')
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}"
+mkdir -p "$state_dir"
+log_file="$state_dir/system-update-check.log"
+
+if (( official_count + aur_count > 0 )); then
+    summary="$((official_count + aur_count)) updates pending: $official_count pacman, $aur_count AUR"
+else
+    summary="System up to date: 0 updates"
+fi
+
+printf '%s %s\n' "$timestamp" "$summary" >> "$log_file"
+
+if (( official_count + aur_count > 0 )) && command -v notify-send >/dev/null 2>&1; then
+    notify-send -a "System Updates" "Updates available" "$summary" 2>/dev/null || true
+fi
+
+printf '%s %s\n' "$timestamp" "$summary"
+if (( official_count > 0 )); then printf '\n[pacman]\n%s\n' "$official"; fi
+if (( aur_count > 0 )); then printf '\n[AUR]\n%s\n' "$aur"; fi
+SH
+
+install_content "$BIN/download-monitor" 755 1 "download-monitor" <<'SH'
+#!/usr/bin/env bash
+# Live Instagram download monitor.
+# Attaches to an active tmux download session; otherwise shows recent progress.
+
+set -uo pipefail
+
+get_sessions() {
+    tmux ls -F '#{session_name}' 2>/dev/null | grep -E '^(ig-|instaloader)' | awk 'NF' || true
+}
+
+attach() {
+    if [[ -n "${TMUX:-}" ]]; then
+        exec tmux switch-client -t "$1"
+    else
+        exec tmux attach -t "$1"
+    fi
+}
+
+show_dashboard() {
+    printf 'Instagram download monitor — %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    printf 'No active download session.\n\nRecent progress:\n\n'
+    shopt -s nullglob
+    local logs=(~/Downloads/*.log)
+    if (( ${#logs[@]} == 0 )); then
+        printf '  (no download logs in ~/Downloads)\n'
+        return
+    fi
+    local recent log last
+    mapfile -t recent < <(ls -t "${logs[@]}" | head -4)
+    for log in "${recent[@]}"; do
+        printf -- '── %s\n' "$(basename "$log")"
+        last=$(grep -aE '^\[[0-9]+/[0-9]+\]|^downloaded |^archive:|^cleanup:' "$log" 2>/dev/null | tail -1)
+        printf '   %s\n\n' "${last:-no progress recorded}"
+    done
+}
+
+if [[ "${1:-}" == "--logs" ]]; then
+    show_dashboard
+    exit 0
+fi
+
+mapfile -t sessions < <(get_sessions)
+
+if (( ${#sessions[@]} == 1 )); then
+    attach "${sessions[0]}"
+elif (( ${#sessions[@]} > 1 )); then
+    printf 'Active download sessions:\n'
+    for i in "${!sessions[@]}"; do
+        printf '  %d) %s\n' "$((i + 1))" "${sessions[$i]}"
+    done
+    read -r -p 'Attach to number (Ctrl+C to cancel): ' choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#sessions[@]} )); then
+        attach "${sessions[$((choice - 1))]}"
+    fi
+    exit 1
+fi
+
+trap 'printf "\n"; exit 0' INT
+while true; do
+    clear
+    show_dashboard
+    printf 'No running session — refreshing every 5s. Ctrl+C to close.\n'
+    sleep 5
+done
+SH
+
+install_content "$BIN/pdm-clara-autodl" 755 1 "pdm-clara-autodl" <<'PY'
+#!/usr/bin/env python3
+import sys
+import time
+from pathlib import Path
+
+import instaloader
+
+USER = "ivan_esteban23"
+TARGET = "pdm.clara"
+DOWNLOAD_DIR = Path.home() / "Downloads"
+DIR = DOWNLOAD_DIR / TARGET
+SCAN_LIMIT = 36
+MEDIA_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov"}
+
+
+def main() -> int:
+    L = instaloader.Instaloader(
+        dirname_pattern=str(DOWNLOAD_DIR / "{profile}"),
+        download_videos=False,
+        save_metadata=True,
+        compress_json=True,
+    )
+    L.load_session_from_file(USER)
+    profile = instaloader.Profile.from_username(L.context, TARGET)
+    # Fixed pattern: collaborative posts otherwise land in the co-author's folder.
+    L.dirname_pattern = str(DIR)
+
+    known = {
+        p.name.split("_UTC")[0]
+        for p in DIR.iterdir()
+        if p.is_file() and "_UTC" in p.name and p.suffix.lower() in MEDIA_SUFFIXES
+    }
+
+    new = 0
+    for i, post in enumerate(profile.get_posts()):
+        if i >= SCAN_LIMIT:
+            break
+        key = post.date_utc.strftime("%Y-%m-%d_%H-%M-%S")
+        if key in known:
+            continue
+        L.download_post(post, target=TARGET)
+        new += 1
+        print(f"new post downloaded: {post.shortcode} ({key} UTC)", flush=True)
+
+    cleaned = 0
+    for p in DIR.iterdir():
+        if p.is_file() and p.name.endswith((".txt", ".json.xz")):
+            p.unlink()
+            cleaned += 1
+
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} done: {new} new posts, {cleaned} metadata files removed", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+PY
+
+install_content "$BIN/ig-download" 755 1 "ig-download" <<'IG'
+#!/usr/bin/env bash
+# =============================================================================
+# ig-download — batch-download any Instagram account (images only)
+#
+# ESTABLISHED CONTEXT / RULES FOR THIS MACHINE:
+#   * Images only: videos are never downloaded (thumbnail .jpg of video posts
+#     is kept). No .mp4/.mov will ever be written.
+#   * Clean archive: every finished run deletes *.txt captions and *.json.xz
+#     metadata from the target folder (also on Ctrl+C / errors).
+#   * Batches: default 100 new posts per run; re-running resumes safely —
+#     posts already on disk are skipped. Use --all for everything remaining.
+#   * Layout: $BASE/<account>/  (default BASE=~/Downloads), flat filenames
+#     "<UTC timestamp>_UTC[_n].jpg".
+#   * Long runs: use tmux. Instagram throttles at roughly 350-450 post
+#     fetches/hour for logged-in accounts; instaloader sleeps through HTTP
+#     429 pauses automatically.
+#   * The hourly systemd timer pdm-clara-autodl.timer separately keeps
+#     pdm.clara up to date via the saved session; this script is the
+#     manual/general-purpose tool for ANY account.
+#
+# LOGIN (default is browser cookies from Firefox):
+#   ig-download USER                       # cookies from Firefox (main login)
+#   ig-download USER --cookies chrome      # cookies from another browser
+#   ig-download USER --cookiefile PATH     # explicit cookies.sqlite path
+#   ig-download USER --session NAME        # reuse saved instaloader session
+#                                          #   (~/.config/instaloader/session-NAME)
+#   ig-download USER --login NAME          # interactive login (password + 2FA)
+#
+#   Cookies are verified with Instagram and the resulting session is saved to
+#   ~/.config/instaloader/session-<username> for future --session runs.
+#   Firefox must be logged in to Instagram; close it while cookies are read.
+#
+# EXAMPLES:
+#   ig-download someuser                   # next 100 new posts
+#   ig-download someuser -n 300            # 300 posts this run
+#   ig-download someuser --all             # every remaining post
+#   ig-download someuser --new-only        # only posts newer than archive
+#   ig-download someuser --session ivan_esteban23 -n 50
+#   ig-download privateuser --login your_ig_user -n 20
+#
+# OPTIONS:
+#   -n, --count N        posts to download this run (default 100, 0 = all)
+#       --all            same as --count 0
+#       --new-only       scan only the newest 36 posts, download missing ones
+#   -d, --base-dir DIR   parent download directory (default ~/Downloads)
+#       --cookies BROWSER  firefox (default), chrome, chromium, brave, edge,
+#                          librewolf, opera, vivaldi
+#       --cookiefile PATH  explicit browser cookies.sqlite
+#       --session USER     use ~/.config/instaloader/session-USER
+#       --login USER       interactive login, save session afterwards
+#   -h, --help           show this help
+# =============================================================================
+
+set -euo pipefail
+
+usage() { sed -n '2,56p' "$0" | sed 's/^# \{0,1\}//'; }
+
+ACCOUNT=""
+COUNT=100
+MODE="batch"
+BASE="$HOME/Downloads"
+COOKIES="firefox"
+COOKIEFILE=""
+SESSION_USER=""
+LOGIN_USER=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -n|--count)     COUNT="${2:?--count needs a value}"; shift 2 ;;
+        --all)          COUNT=0; shift ;;
+        --new-only)     MODE="new"; shift ;;
+        -d|--base-dir)  BASE="${2:?--base-dir needs a value}"; shift 2 ;;
+        --cookies)      COOKIES="${2:?--cookies needs a value}"; shift 2 ;;
+        --cookiefile)   COOKIEFILE="${2:?--cookiefile needs a value}"; shift 2 ;;
+        --session)      SESSION_USER="${2:?--session needs a value}"; shift 2 ;;
+        --login)        LOGIN_USER="${2:?--login needs a value}"; shift 2 ;;
+        -h|--help)      usage; exit 0 ;;
+        -*)             echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
+        *)
+            if [[ -z "$ACCOUNT" ]]; then
+                ACCOUNT="$1"; shift
+            else
+                echo "unexpected argument: $1" >&2; exit 2
+            fi
+            ;;
+    esac
+done
+
+[[ -n "$ACCOUNT" ]] || { usage >&2; exit 2; }
+[[ "$COUNT" =~ ^[0-9]+$ ]] || { echo "--count must be a non-negative integer" >&2; exit 2; }
+if [[ -n "$LOGIN_USER$SESSION_USER" && -n "$COOKIEFILE" ]]; then
+    echo "use either --login/--session or --cookies/--cookiefile, not both" >&2
+    exit 2
+fi
+
+TARGET_DIR="$BASE/$ACCOUNT"
+mkdir -p "$TARGET_DIR"
+
+cleanup_metadata() {
+    local n
+    n=$(find "$TARGET_DIR" -maxdepth 1 -type f \( -name '*.txt' -o -name '*.json.xz' \) | wc -l)
+    if [[ "$n" -gt 0 ]]; then
+        find "$TARGET_DIR" -maxdepth 1 -type f \( -name '*.txt' -o -name '*.json.xz' \) -delete
+        echo "cleanup: removed $n metadata files (.txt, .json.xz)"
+    fi
+}
+trap cleanup_metadata EXIT
+
+IG_ACCOUNT="$ACCOUNT" IG_COUNT="$COUNT" IG_MODE="$MODE" IG_BASE="$BASE" \
+IG_COOKIES="$COOKIES" IG_COOKIEFILE="$COOKIEFILE" \
+IG_SESSION="$SESSION_USER" IG_LOGIN="$LOGIN_USER" \
+python3 - <<'PY'
+import os
+import time
+from pathlib import Path
+
+import instaloader
+
+account = os.environ["IG_ACCOUNT"]
+base = Path(os.environ["IG_BASE"]).expanduser()
+count = int(os.environ["IG_COUNT"])
+mode = os.environ["IG_MODE"]
+cookie_browser = os.environ["IG_COOKIES"]
+cookie_file = os.environ["IG_COOKIEFILE"]
+session_user = os.environ["IG_SESSION"]
+login_user = os.environ["IG_LOGIN"]
+
+L = instaloader.Instaloader(
+    dirname_pattern=str(base / "{profile}"),
+    download_videos=False,
+    save_metadata=True,
+    compress_json=True,
+)
+
+if login_user:
+    L.interactive_login(login_user)
+    L.save_session_to_file()
+    print(f"logged in as {login_user} (session saved)")
+elif session_user:
+    L.load_session_from_file(session_user)
+    print(f"using saved session for {session_user}")
+else:
+    from instaloader.__main__ import import_session
+    try:
+        import_session(cookie_browser.lower(), L, cookie_file or None)
+    except Exception:
+        if cookie_browser.lower() != "firefox" or cookie_file:
+            raise
+        candidates = (sorted(Path.home().glob(".config/mozilla/firefox/*/cookies.sqlite"))
+                      + sorted(Path.home().glob(".mozilla/firefox/*/cookies.sqlite")))
+        if not candidates:
+            raise
+        for db in candidates:
+            try:
+                import_session("firefox", L, str(db))
+                break
+            except Exception:
+                continue
+        else:
+            raise
+    try:
+        L.save_session_to_file()
+        print(f"session saved for {L.context.username}")
+    except Exception:
+        pass
+
+profile = instaloader.Profile.from_username(L.context, account)
+print(f"profile: {profile.username} — {profile.mediacount} posts")
+target_dir = base / profile.username
+target_dir.mkdir(parents=True, exist_ok=True)
+# Fixed pattern: collaborative posts otherwise land in the co-author's folder.
+L.dirname_pattern = str(target_dir)
+
+known = {
+    p.name.split("_UTC")[0]
+    for p in target_dir.iterdir()
+    if p.is_file() and "_UTC" in p.name
+    and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov"}
+}
+print(f"local archive: {len(known)} posts")
+
+def fetch(post):
+    for attempt in range(1, 4):
+        try:
+            L.download_post(post, target=profile.username)
+            return
+        except instaloader.ConnectionException as e:
+            if attempt == 3:
+                raise
+            wait = 20 * attempt
+            print(f"retry {attempt}/3 in {wait}s: {e}", flush=True)
+            time.sleep(wait)
+
+new = 0
+if mode == "new":
+    for i, post in enumerate(profile.get_posts()):
+        if i >= 36:
+            break
+        key = post.date_utc.strftime("%Y-%m-%d_%H-%M-%S")
+        if key in known:
+            continue
+        fetch(post)
+        new += 1
+        print(f"new: {post.shortcode} ({key} UTC)", flush=True)
+else:
+    goal = count if count > 0 else None
+    for post in profile.get_posts():
+        key = post.date_utc.strftime("%Y-%m-%d_%H-%M-%S")
+        if key in known:
+            continue
+        fetch(post)
+        new += 1
+        print(f"[{new}/{goal if goal else 'all'}] {post.shortcode} ({key} UTC)", flush=True)
+        if goal and new >= goal:
+            break
+
+print(f"downloaded {new} new posts", flush=True)
+PY
+
+IMG_COUNT=$(find "$TARGET_DIR" -maxdepth 1 -type f \
+    \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' \) | wc -l)
+echo "archive: $IMG_COUNT images in $TARGET_DIR ($(du -sh "$TARGET_DIR" | cut -f1))"
+IG
+
+install_self
+
+# -----------------------------------------------------------------------------
+# 3. systemd --user units
+# -----------------------------------------------------------------------------
+install_content "$UNIT_DIR/pdm-clara-autodl.service" 644 1 "pdm-clara-autodl.service" <<'UNIT'
+[Unit]
+Description=Download new pdm.clara Instagram posts (images only)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/flock -n /tmp/pdm-clara-autodl.lock /usr/bin/python3 %h/.local/bin/pdm-clara-autodl
+UNIT
+
+install_content "$UNIT_DIR/pdm-clara-autodl.timer" 644 1 "pdm-clara-autodl.timer" <<'UNIT'
+[Unit]
+Description=Check pdm.clara for new Instagram posts every hour
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=120
+Persistent=true
+RemainAfterElapse=no
+
+[Install]
+WantedBy=timers.target
+UNIT
+pdm_timer_changed=$LAST_CHANGED
+
+install_content "$UNIT_DIR/julie-autodl.service" 644 1 "julie-autodl.service" <<'UNIT'
+[Unit]
+Description=Download new julie.tuzet Instagram posts (images only)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/flock -n /tmp/julie-autodl.lock %h/.local/bin/ig-download julie.tuzet --new-only --session ivan_esteban23
+UNIT
+
+install_content "$UNIT_DIR/julie-autodl.timer" 644 1 "julie-autodl.timer" <<'UNIT'
+[Unit]
+Description=Check julie.tuzet for new Instagram posts hourly
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=300
+Persistent=true
+RemainAfterElapse=no
+
+[Install]
+WantedBy=timers.target
+UNIT
+julie_timer_changed=$LAST_CHANGED
+
+install_content "$UNIT_DIR/system-update-check.service" 644 1 "system-update-check.service" <<'UNIT'
+[Unit]
+Description=Check for pending system package updates
+
+[Service]
+Type=oneshot
+ExecStart=/home/ivanaguilera/.local/bin/system-update-check
+UNIT
+
+install_content "$UNIT_DIR/system-update-check.timer" 644 1 "system-update-check.timer" <<'UNIT'
+[Unit]
+Description=Check for system package updates every 3 hours
+
+[Timer]
+OnCalendar=00/3:00
+RandomizedDelaySec=300
+Persistent=true
+RemainAfterElapse=no
+
+[Install]
+WantedBy=timers.target
+UNIT
+update_timer_changed=$LAST_CHANGED
+
+have_systemd() { systemctl --user show-environment >/dev/null 2>&1; }
+
+if [[ "$ENABLE" -eq 1 ]] && have_systemd; then
+  if [[ "$MODE" == "apply" ]]; then
+    systemctl --user daemon-reload
+    for t in "${TIMERS[@]}"; do
+      case "$t" in
+        pdm-clara-autodl.timer)      tc=$pdm_timer_changed ;;
+        julie-autodl.timer)          tc=$julie_timer_changed ;;
+        system-update-check.timer)   tc=$update_timer_changed ;;
+        *)                           tc=0 ;;
+      esac
+      was="$(systemctl --user is-enabled "$t" 2>/dev/null || true)"
+      if systemctl --user enable --now "$t" >/dev/null 2>&1; then
+        if [[ "$tc" -eq 1 ]]; then
+          systemctl --user try-restart "$t" >/dev/null 2>&1 || true
+        fi
+        if [[ "$was" == "enabled" ]]; then
+          ok "$t enabled"
+        else
+          fix "$t enabled"
+        fi
+      else
+        drift "$t could not be enabled"
+      fi
+    done
+  else
+    for t in "${TIMERS[@]}"; do
+      state="$(systemctl --user is-enabled "$t" 2>/dev/null || true)"
+      active="$(systemctl --user is-active "$t" 2>/dev/null || true)"
+      next="$(systemctl --user show -p NextElapseUSecRealtime --value "$t" 2>/dev/null || true)"
+      if [[ "$state" == "enabled" && "$active" == "active" && -n "$next" && "$next" != "0" ]]; then
+        ok "$t ($next)"
+      else
+        drift "$t (enabled=$state active=$active next=${next:-none})"
+      fi
+    done
+  fi
+else
+  note "systemd user bus unavailable or --no-enable: timers not touched"
+fi
+
+# -----------------------------------------------------------------------------
+# 4. Codex config: keep read-only default, allow network for workspace-write
+# -----------------------------------------------------------------------------
+codex_config_patch() {
+  local mode="$1"
+  python3 - "$CODEX_CONFIG" "$mode" <<'PY'
+import os
+import re
+import shutil
+import sys
+import tempfile
+
+path, mode = sys.argv[1], sys.argv[2]
+try:
+    with open(path, encoding="utf-8") as fh:
+        original = fh.read()
+except FileNotFoundError:
+    original = ""
+
+def is_header(line):
+    return line.lstrip().startswith("[")
+
+def section_index(lines, name):
+    pat = re.compile(r"^\s*\[" + re.escape(name) + r"\]\s*(?:#.*)?$")
+    return next((i for i, line in enumerate(lines) if pat.match(line)), -1)
+
+def next_section(lines, start):
+    return next((i for i in range(start + 1, len(lines)) if is_header(lines[i])), len(lines))
+
+def is_key(line, key):
+    return re.match(r"^\s*" + re.escape(key) + r"\s*=", line) is not None
+
+lines = original.splitlines()
+notes = []
+
+first = next((i for i, line in enumerate(lines) if is_header(line)), len(lines))
+if not any(is_key(line, "sandbox_mode") for line in lines[:first]):
+    lines.insert(first, 'sandbox_mode = "read-only"')
+    notes.append("sandbox_mode read-only")
+
+if any(re.match(r"^\s*sandbox_workspace_write\s*=", line) for line in lines):
+    print("ERROR inline sandbox_workspace_write table; edit manually", file=sys.stderr)
+    sys.exit(3)
+
+idx = section_index(lines, "sandbox_workspace_write")
+if idx == -1:
+    if lines and lines[-1].strip():
+        lines.append("")
+    lines.extend([
+        "# Added by agent-rules-setup: DNS/HTTPS for workspace-write sandboxes (codex-git)",
+        "[sandbox_workspace_write]",
+        "network_access = true",
+    ])
+    notes.append("network_access=true")
+else:
+    end = next_section(lines, idx)
+    found = False
+    for i in range(idx + 1, end):
+        match = re.match(r"^(\s*)network_access\s*=\s*(true|false)(\s*(?:#.*)?)$", lines[i], re.I)
+        if match:
+            found = True
+            if match.group(2).lower() != "true":
+                lines[i] = f"{match.group(1)}network_access = true{match.group(3)}"
+                notes.append("network_access=true")
+            break
+    if not found:
+        lines.insert(idx + 1, "network_access = true")
+        notes.append("network_access=true")
+
+updated = "\n".join(lines).rstrip("\n") + "\n"
+if updated == original:
+    sys.exit(0)
+
+if mode == "check":
+    print("DRIFT " + (", ".join(notes) or "config"))
+    sys.exit(4)
+
+os.makedirs(os.path.dirname(path), exist_ok=True)
+if original and not os.path.exists(path + ".bak-agent-rules"):
+    shutil.copy2(path, path + ".bak-agent-rules")
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".config.toml.")
+with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    fh.write(updated)
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+print("FIXED " + (", ".join(notes) or "config"))
+sys.exit(10)
+PY
+}
+
+if [[ "$MODE" == "check" ]]; then
+  set +e
+  out="$(codex_config_patch check 2>&1)"
+  rc=$?
+  set -e
+  case "$rc" in
+    0) ok "~/.codex/config.toml" ;;
+    4) drift "~/.codex/config.toml ($out)" ;;
+    *) drift "~/.codex/config.toml ($out)" ;;
+  esac
+else
+  set +e
+  out="$(codex_config_patch apply 2>&1)"
+  rc=$?
+  set -e
+  case "$rc" in
+    0) ok "~/.codex/config.toml" ;;
+    10) fix "~/.codex/config.toml (${out#FIXED })" ;;
+    3) drift "~/.codex/config.toml: $out" ;;
+    *) drift "~/.codex/config.toml ($out)" ;;
+  esac
+fi
+
+# -----------------------------------------------------------------------------
+# Optional smoke test: real Codex sandbox, login shell, gh + git + signing
+# -----------------------------------------------------------------------------
+run_smoke() {
+  command -v codex >/dev/null 2>&1 || { note "codex not installed; smoke skipped"; return 0; }
+  [[ -x "$BIN/gh" ]] || { drift "smoke: $BIN/gh missing"; return 0; }
+
+  local repo=""
+  while IFS= read -r d; do repo="${d%/.git}"; break; done \
+    < <(ls -d "$HOME_DIR"/Work/*/.git 2>/dev/null || true)
+  [[ -n "$repo" ]] || repo="$HOME_DIR"
+
+  local token
+  token="$("$HOME_DIR/.local/share/mise/shims/gh" auth token 2>/dev/null || true)"
+  [[ -n "$token" ]] || token="$(gh auth token 2>/dev/null || true)"
+
+  printf '  smoke Codex sandbox (%s)...\n' "$repo"
+  if (
+    cd "$repo"
+    GH_TOKEN="$token" codex sandbox \
+      -c sandbox_mode="workspace-write" \
+      -c sandbox_workspace_write.network_access=true \
+      -c shell_environment_policy.inherit=all \
+      -- bash -lc '
+        set -e
+        getent hosts github.com >/dev/null
+        ~/.local/bin/gh auth status >/dev/null
+        ~/.local/bin/gh api user --jq .login >/dev/null
+        if git rev-parse --git-dir >/dev/null 2>&1 && git remote get-url origin >/dev/null 2>&1; then
+          git ls-remote --heads origin >/dev/null
+        fi
+        tmp=$(mktemp -d)
+        cd "$tmp" && git init -q r && cd r
+        git -c user.name=smoke -c user.email=smoke@example.com commit -q --allow-empty -m smoke
+        git log --show-signature -1 2>&1 | grep -q "Good \"git\" signature"
+        cd / && rm -rf "$tmp"
+      ' >/dev/null 2>&1
+  ); then
+    ok "smoke: DNS, gh auth/API, git fetch, SSH signing"
+  else
+    drift "smoke failed: DNS/gh/git/signing inside Codex sandbox"
+  fi
+}
+
+if [[ "$SMOKE" -eq 1 ]]; then
+  if [[ "$MODE" == "check" ]]; then
+    note "--smoke ignored in --check mode"
+  else
+    run_smoke
+  fi
+fi
+
+# -----------------------------------------------------------------------------
+# Runtime checks (--check)
+# -----------------------------------------------------------------------------
+check_runtime() {
+  local c
+  for c in mise git tmux checkupdates python3 gh codex; do
+    if command -v "$c" >/dev/null 2>&1; then
+      ok "command: $c"
+    else
+      drift "command missing: $c"
+    fi
+  done
+  if python3 -c 'import instaloader' >/dev/null 2>&1; then
+    ok "python: instaloader"
+  else
+    drift "python: instaloader missing"
+  fi
+  if command -v notify-send >/dev/null 2>&1; then
+    ok "notify-send"
+  else
+    note "notify-send missing (desktop notifications off)"
+  fi
+  if command -v mise >/dev/null 2>&1; then
+    if mise which gh >/dev/null 2>&1; then
+      ok "mise tool: gh"
+    else
+      drift "mise tool missing: gh"
+    fi
+    if mise which codex >/dev/null 2>&1; then
+      ok "mise tool: codex"
+    else
+      drift "mise tool missing: codex"
+    fi
+  fi
+  if gh auth status >/dev/null 2>&1; then
+    ok "gh authenticated"
+  else
+    note "gh not authenticated (expected on a fresh restore)"
+  fi
+  if [[ -f "$CODEX_HOME/auth.json" ]]; then
+    ok "codex authenticated"
+  else
+    note "codex not logged in (expected on a fresh restore)"
+  fi
+}
+
+if [[ "$MODE" == "check" ]]; then
+  check_runtime
+fi
+
+# -----------------------------------------------------------------------------
+# Summary
+# -----------------------------------------------------------------------------
+echo
+if [[ "$MODE" == "check" ]]; then
+  if (( problems > 0 )); then
+    echo "check: $problems problem(s); run without --check to fix"
+    exit 1
+  fi
+  echo "check: all rules and fixes in place"
+  exit 0
+fi
+
+echo "apply: $changes change(s)"
+if (( BOOTSTRAP )); then
+  print_post_restore
+fi
+if (( problems > 0 )); then
+  echo "apply: $problems item(s) still need attention"
+  exit 1
+fi
+exit 0
