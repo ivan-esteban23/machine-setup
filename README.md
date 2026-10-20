@@ -1,20 +1,31 @@
 # machine-setup
 
-Recovery kit for this Omarchy machine: agent rules, Instagram download timers, system update checks, and the Codex sandbox/GitHub fixes that let `git push` and `gh pr create` complete.
+Recovery kit for this Omarchy machine: agent rules, Instagram download timers, system update checks, mobile remote-control units, personal desktop/tool config, and the Codex sandbox/GitHub fixes that let `git push` and `gh pr create` complete.
 
 Everything is in **`agent-rules-setup`** — one idempotent, self-contained bash script. `snapshot/` holds machine-specific extras (tool configs, package lists, git identity).
 
+Print the full reinstall runbook at any time:
+
+```bash
+agent-rules-setup --restore-guide
+```
+
 ## What `--bootstrap` restores
 
-- Rule files: `~/AGENTS.md`, `~/.qoder/AGENTS.md`, `~/.codex/AGENTS.md`
-- Tools: `ig-download`, `download-monitor`, `pdm-clara-autodl`, `system-update-check`, `codex-git`, and a `gh` wrapper that survives the read-only Codex sandbox
+- Rule files: `~/AGENTS.md`, `~/GEMINI.md`, `~/.gemini/config/AGENTS.md`, `~/.qoder/AGENTS.md`, `~/.codex/AGENTS.md`
+- Tools: `ig-download`, `download-monitor`, `pdm-clara-autodl`, `system-update-check`, `codex-git`, `obsidian` CLI bridge, `wireguard-jp-toggle`, the `gh` wrapper that survives the read-only Codex sandbox, and mise wrappers (`claude`, `codex`, `gemini`, `grok`, `copilot`, `crush`, `opencode`, `pi`, `muse`, `cursor-agent`, `hunk`, `omp`, `ghui`, `playwright`)
 - systemd user timers (enabled + linger):
   - `pdm-clara-autodl.timer` — hourly, images only
   - `julie-autodl.timer` — hourly, images only
   - `system-update-check.timer` — every 3 hours, calendar-based
+- systemd user services (enabled):
+  - `codex-remote-control.service` — Codex mobile/browser access
+  - `qoder-remote-control.service` — Qoder mobile/browser access
 - Codex: default sandbox stays `read-only`; `[sandbox_workspace_write] network_access = true`
 - mise global tool set from `snapshot/mise-config.toml`
+- `free-claude-code` via `uv tool install` when `uv` is available
 - git identity / signing settings and `allowed_signers` from the snapshot
+- personal config from `snapshot/config/` (only files that are missing): git aliases/ignore, starship, alacritty, Hypr bindings, Omarchy bar layout, fcitx5 profile + tray drop-in, GTK_IM_MODULE, Obsidian vault registry, VS Code settings, Qoder settings, Claude theme
 - `~/.local/bin` on `PATH` in `.bash_profile` and `.bashrc`
 - optional: the snapshotted pacman + AUR package lists (`--with-packages`)
 
@@ -64,41 +75,62 @@ agent-rules-setup --smoke
 
 `--smoke` starts a real Codex sandbox and checks DNS, `gh` API access, `git ls-remote`, and SSH commit signing.
 
+Sidecar tools that need their own installer (none are in this repo):
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh   # uv / uvx
+uv tool install free-claude-code                  # fcc-*
+# qodercli, agy (Antigravity), and reason: vendor installers
+sudo cp wg-JP-446.conf /etc/wireguard/            # from secure backup
+sudo systemctl enable --now wg-quick@wg-JP-446
+```
+
 ## NOT in this repo
 
 Never commit these; restore them from your secure backup:
 
 | Path | Why |
 |---|---|
-| `~/.ssh/id_ed25519_signing` | private commit-signing key |
+| `~/.ssh/` | private commit-signing key + `allowed_signers` |
 | `~/.codex/auth.json` | Codex login |
+| `~/.config/gh/hosts.yml` | gh token |
 | `~/.config/instaloader/session-*` | Instagram session |
+| `~/.secrets/github-token` | local token copy |
+| `~/.fcc/.env` | free-claude-code credentials |
+| `~/.bashrc` | contains `TAVILY_API_KEY` |
+| `/etc/wireguard/wg-JP-446.conf` | VPN private key (root-owned) |
 | `~/Downloads` | Instagram archives |
 | `~/Work`, `~/Documents/Obsidian Vault` | personal data |
+| `~/Pictures`, `~/Videos` | personal media |
 
-If the signing key is missing, bootstrap leaves `commit.gpgsign` off and prints instructions. Do not regenerate it unless you register the new public key as a GitHub signing key.
+If the signing key is missing, bootstrap turns `commit.gpgsign` off and prints instructions. Do not regenerate it unless you register the new public key as a GitHub signing key.
 
 ## Before wiping the disk
 
 ```bash
 cd ~/Work/machine-setup
-./agent-rules-setup --snapshot --push
+./agent-rules-setup --pre-reset     # snapshot + commit + push + full runbook
 ```
 
 Then back up separately:
 
-- `~/Downloads` (Instagram archives), `~/Work`, `~/Documents/Obsidian Vault`
+- `~/Downloads` (Instagram archives), `~/Work`, `~/Documents/Obsidian Vault`, `~/Pictures`, `~/Videos`
 - `~/.ssh` (including the private signing key)
 - `~/.codex/auth.json`
+- `~/.config/gh/hosts.yml`
 - `~/.config/instaloader/session-*`
+- `~/.secrets/github-token`, `~/.fcc/.env`, `~/.bashrc` (Tavily key)
+- `/etc/wireguard/wg-JP-446.conf`
 - anything else in `$HOME` not covered by the snapshot
 
 ## Day-to-day
 
 ```bash
-agent-rules-setup            # apply / repair everything (safe to re-run)
-agent-rules-setup --check    # report drift only, exit 1 if anything is off
-agent-rules-setup --smoke    # real Codex sandbox git/gh/signing test
+agent-rules-setup                 # apply / repair everything (safe to re-run)
+agent-rules-setup --check         # report drift only, exit 1 if anything is off
+agent-rules-setup --smoke         # real Codex sandbox git/gh/signing test
+agent-rules-setup --restore-guide # full reinstall runbook
+agent-rules-setup --snapshot --push  # refresh snapshot/ and push it
 ```
 
 ## Why Codex PRs used to fail

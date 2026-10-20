@@ -6,10 +6,12 @@
 #
 # What this installs / repairs:
 #   1. Rule files (written only when missing, or with --force)
-#        ~/AGENTS.md           autonomy / no-confirmation rules
-#        ~/.qoder/AGENTS.md    Instagram, download monitoring, update checks,
-#                              account timers, Codex sandbox rules
-#        ~/.codex/AGENTS.md    end-of-task GitHub sync rule
+#        ~/AGENTS.md                 autonomy / no-confirmation rules
+#        ~/GEMINI.md                 same autonomy rules for Gemini CLI
+#        ~/.gemini/config/AGENTS.md  same autonomy rules for Gemini CLI
+#        ~/.qoder/AGENTS.md          Instagram, download monitoring, update
+#                                    checks, account timers, Codex sandbox rules
+#        ~/.codex/AGENTS.md          end-of-task GitHub sync rule
 #   2. Tools in ~/.local/bin
 #        ig-download           images-only Instagram archiver, metadata cleanup
 #        download-monitor      tmux/log progress monitor for downloads
@@ -18,15 +20,26 @@
 #        codex-git             Codex with workspace-write + network + GH_TOKEN
 #        gh                    fixed wrapper: falls back to the mise shim when
 #                              the filesystem is read-only (Codex sandbox)
-#   3. systemd --user timers
+#        obsidian              CLI bridge to Obsidian's Unix socket
+#        wireguard-jp-toggle   SUPER+SHIFT+V VPN toggle (wg-quick@wg-JP-446)
+#        claude, codex, gemini, grok, copilot, crush, opencode, opencode,
+#        pi, muse, cursor-agent, hunk, omp, ghui, playwright
+#                              mise-run wrappers (auto-install on first use)
+#   3. systemd --user timers and remote-control services
 #        pdm-clara-autodl.timer     hourly, RemainAfterElapse=no
 #        julie-autodl.timer         hourly, RemainAfterElapse=no   (fixed)
 #        system-update-check.timer  every 3h, calendar-based       (fixed)
+#        codex-remote-control.service   Codex mobile/browser access
+#        qoder-remote-control.service   Qoder mobile/browser access
 #      The old OnBootSec/OnUnitActiveSec pair can wedge at next_elapse=0
 #      after a failed run; OnCalendar + RemainAfterElapse=no cannot.
 #   4. ~/.codex/config.toml
 #        sandbox_mode stays "read-only"; [sandbox_workspace_write] gets
 #        network_access = true so codex-git and PR work have DNS + HTTPS.
+#   5. Snapshot-managed personal config (copied only when missing)
+#        git aliases/ignore, starship, alacritty, Hypr bindings, Omarchy bar,
+#        fcitx5 profile + systemd drop-in, GTK_IM_MODULE, Obsidian vault
+#        registry, VS Code settings, Qoder settings, Claude theme
 #
 # Why Codex used to block PR completion:
 #   * default read-only sandbox has no DNS/network -> gh and git push fail
@@ -39,12 +52,19 @@
 # Usage:
 #   agent-rules-setup                 apply everything (safe to re-run)
 #   agent-rules-setup --check         report drift only, change nothing (exit 1)
-#   agent-rules-setup --force         also overwrite the three AGENTS.md files
+#   agent-rules-setup --force         also overwrite the AGENTS.md / GEMINI.md files
 #   agent-rules-setup --no-enable     install files but do not touch systemd
 #   agent-rules-setup --smoke         after applying, run a real sandbox git/gh test
+#   agent-rules-setup --restore-guide print the full reinstall/restore runbook
+#   agent-rules-setup --pre-reset     snapshot + push, then print the wipe checklist
 #
 # Recovery on a fresh Omarchy install (mise is part of Omarchy; it is not
 # reinstalled here):
+#   mise use -g gh
+#   gh auth login
+#   mkdir -p ~/Work
+#   gh repo clone ivan-esteban23/machine-setup ~/Work/machine-setup
+#   cd ~/Work/machine-setup
 #   ./agent-rules-setup --bootstrap                 deps + tools + configs + apply
 #   ./agent-rules-setup --bootstrap --minimal       only gh + codex (skip full mise set)
 #   ./agent-rules-setup --bootstrap --with-packages reinstall the snapshotted
@@ -53,10 +73,15 @@
 #   ./agent-rules-setup --snapshot --push           snapshot, commit, and push the repo
 #
 # NOT included (never commit these; restore from a secure backup):
-#   ~/.ssh/id_ed25519_signing   private signing key
-#   ~/.codex/auth.json          Codex login
-#   ~/.config/instaloader/session-*  Instagram session
-#   ~/Downloads, ~/Work, ~/Documents/Obsidian Vault
+#   ~/.ssh/id_ed25519_signing         private signing key
+#   ~/.codex/auth.json                Codex login
+#   ~/.config/gh/hosts.yml            gh token
+#   ~/.config/instaloader/session-*   Instagram session
+#   ~/.secrets/github-token           local token copy
+#   ~/.fcc/.env                       free-claude-code credentials
+#   ~/.bashrc                         contains TAVILY_API_KEY
+#   /etc/wireguard/wg-JP-446.conf     VPN private key (root-owned)
+#   ~/Downloads, ~/Work, ~/{Documents/Obsidian Vault,Pictures,Videos}
 # After restoring, log in again: gh auth login && gh auth setup-git; codex login;
 # log into instagram.com in Firefox and run ig-download ... --cookies firefox.
 # =============================================================================
@@ -72,6 +97,8 @@ WITH_PACKAGES=0
 MINIMAL=0
 SNAPSHOT_MODE=0
 PUSH=0
+RESTORE_GUIDE=0
+PRE_RESET=0
 
 usage() {
   awk 'f && /^# ={20,}$/ {exit} /^# Usage:/{f=1} f {sub(/^# ?/, ""); print}' "$0"
@@ -89,6 +116,8 @@ while [[ $# -gt 0 ]]; do
     --minimal)        MINIMAL=1; shift ;;
     --snapshot)       SNAPSHOT_MODE=1; shift ;;
     --push)           PUSH=1; shift ;;
+    --restore-guide)  RESTORE_GUIDE=1; shift ;;
+    --pre-reset)      PRE_RESET=1; SNAPSHOT_MODE=1; PUSH=1; shift ;;
     -h|--help)        usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
@@ -97,12 +126,17 @@ done
 HOME_DIR="${HOME:?HOME is not set}"
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
 REPO_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+# The installed copy in ~/.local/bin should still snapshot into the checkout.
+if [[ ! -d "$REPO_DIR/.git" && -d "$HOME_DIR/Work/machine-setup/.git" ]]; then
+  REPO_DIR="$HOME_DIR/Work/machine-setup"
+fi
 SNAPSHOT_DIR="$REPO_DIR/snapshot"
 BIN="$HOME_DIR/.local/bin"
 UNIT_DIR="$HOME_DIR/.config/systemd/user"
 CODEX_HOME="${CODEX_HOME:-$HOME_DIR/.codex}"
 CODEX_CONFIG="$CODEX_HOME/config.toml"
 TIMERS=(pdm-clara-autodl.timer julie-autodl.timer system-update-check.timer)
+SERVICES=(codex-remote-control.service qoder-remote-control.service)
 
 changes=0
 problems=0
@@ -242,6 +276,91 @@ restore_file() {
   fix "$label"
 }
 
+# Personal config restored on a fresh machine, never overwritten afterwards.
+CONFIG_MANIFEST=(
+  ".config/git/config"
+  ".config/git/ignore"
+  ".config/starship.toml"
+  ".config/alacritty/alacritty.toml"
+  ".config/hypr/autostart.lua"
+  ".config/hypr/bindings.lua"
+  ".config/hypr/hyprland.lua"
+  ".config/hypr/hyprsunset.conf"
+  ".config/hypr/input.lua"
+  ".config/hypr/looknfeel.lua"
+  ".config/hypr/monitors.lua"
+  ".config/hypr/xdph.conf"
+  ".config/omarchy/shell.json"
+  ".config/omarchy/defaults/agent"
+  ".config/environment.d/20-fcitx-gtk.conf"
+  ".config/systemd/user/omarchy-fcitx5.service.d/override.conf"
+  ".config/fcitx5/profile"
+  ".config/fcitx5/conf/classicui.conf"
+  ".config/fcitx5/conf/clipboard.conf"
+  ".config/fcitx5/conf/hangul.conf"
+  ".config/fcitx5/conf/notifications.conf"
+  ".config/fcitx5/conf/xcb.conf"
+  ".config/obsidian/obsidian.json"
+  ".config/Code/User/settings.json"
+  ".qoder/settings.json"
+  ".claude/settings.json"
+)
+
+has_secret() {
+  grep -qE 'gh[pousr]_[A-Za-z0-9]{20,}|github_pat_|sk-[A-Za-z0-9]{20,}|AIza[0-9A-Za-z_-]{20,}|xox[baprs]-|tvly-[A-Za-z0-9_-]{10,}|BEGIN [A-Z ]*PRIVATE KEY' "$1"
+}
+
+snapshot_configs() {
+  local dir="$SNAPSHOT_DIR/config" rel src count=0
+  local skipped=()
+  mkdir -p "$dir"
+  for rel in "${CONFIG_MANIFEST[@]}"; do
+    src="$HOME_DIR/$rel"
+    [[ -f "$src" ]] || continue
+    if has_secret "$src"; then
+      skipped+=("$rel")
+      continue
+    fi
+    mkdir -p "$dir/$(dirname "$rel")"
+    cp -p "$src" "$dir/$rel"
+    count=$((count + 1))
+  done
+  ok "personal config: $count files"
+  if (( ${#skipped[@]} > 0 )); then
+    note "config with token-like values skipped: ${skipped[*]}"
+  fi
+}
+
+restore_configs() {
+  local rel src dest
+  for rel in "${CONFIG_MANIFEST[@]}"; do
+    src="$SNAPSHOT_DIR/config/$rel"
+    [[ -f "$src" ]] || continue
+    dest="$HOME_DIR/$rel"
+    if [[ -f "$dest" ]]; then
+      ok "config: $rel"
+      continue
+    fi
+    if [[ "$MODE" == "check" ]]; then
+      drift "config missing: $rel"
+      continue
+    fi
+    mkdir -p "$(dirname "$dest")"
+    install -m "$(stat -c %a "$src")" "$src" "$dest"
+    fix "config: $rel"
+  done
+}
+
+install_mise_wrapper() {
+  local cmd="$1" spec="$2"
+  install_content "$BIN/$cmd" 755 1 "mise wrapper: $cmd" <<EOF
+#!/bin/bash
+export MISE_MINIMUM_RELEASE_AGE=0
+mise use -g --quiet "$spec" || exit 1
+exec mise x "$spec" -- "$cmd" "\$@"
+EOF
+}
+
 read_snap() {
   if [[ -s "$1" ]]; then
     head -1 "$1"
@@ -292,8 +411,30 @@ bootstrap_mise() {
 }
 
 bootstrap_configs() {
+  restore_configs
   restore_file "$SNAPSHOT_DIR/codex-config.toml" "$CODEX_HOME/config.toml" 600 "codex config"
   restore_file "$SNAPSHOT_DIR/allowed_signers" "$HOME_DIR/.ssh/allowed_signers" 644 "SSH allowed signers"
+}
+
+bootstrap_uv_tool() {
+  if command -v fcc-claude >/dev/null 2>&1; then
+    ok "uv tool: free-claude-code"
+    return 0
+  fi
+  if ! command -v uv >/dev/null 2>&1; then
+    note "uv missing; reinstall it first (curl -LsSf https://astral.sh/uv/install.sh | sh)"
+    note "then: uv tool install free-claude-code"
+    return 0
+  fi
+  if [[ "$MODE" == "check" ]]; then
+    drift "uv tool missing: free-claude-code"
+    return 0
+  fi
+  if uv tool install free-claude-code; then
+    fix "uv tool: free-claude-code"
+  else
+    drift "uv tool install failed: free-claude-code"
+  fi
 }
 
 git_set_if_empty() {
@@ -342,6 +483,16 @@ bootstrap_git() {
   else
     note "private signing key missing (${skey:-~/.ssh/id_ed25519_signing}); signing left off"
     note "restore it from secure backup, then rerun --bootstrap (never commit it)"
+    if [[ "$(git config --global --bool --get commit.gpgsign 2>/dev/null || true)" == "true" ]] \
+      || [[ "$(git config --global --bool --get tag.gpgsign 2>/dev/null || true)" == "true" ]]; then
+      if [[ "$MODE" == "check" ]]; then
+        drift "git signing enabled without a private key"
+      else
+        git config --global commit.gpgsign false
+        git config --global tag.gpgsign false
+        fix "git signing disabled until the key is restored"
+      fi
+    fi
   fi
 
   if gh auth status >/dev/null 2>&1; then
@@ -413,6 +564,7 @@ bootstrap_all() {
   bootstrap_mise
   bootstrap_configs
   bootstrap_git
+  bootstrap_uv_tool
   ensure_path_block "$HOME_DIR/.bash_profile"
   ensure_path_block "$HOME_DIR/.bashrc"
   bootstrap_linger
@@ -458,6 +610,8 @@ snapshot_all() {
     ok "SSH allowed signers"
   fi
 
+  snapshot_configs
+
   git config --global --get user.name >"$dir/git-user-name" 2>/dev/null || :
   git config --global --get user.email >"$dir/git-user-email" 2>/dev/null || :
   git config --global --get user.signingkey >"$dir/git-signing-key" 2>/dev/null || :
@@ -474,8 +628,13 @@ snapshot_all() {
   printf 'Back these up separately — never commit them:\n'
   printf '  ~/.ssh/id_ed25519_signing        private signing key\n'
   printf '  ~/.codex/auth.json               Codex login\n'
+  printf '  ~/.config/gh/hosts.yml           gh token\n'
   printf '  ~/.config/instaloader/session-*  Instagram session\n'
-  printf '  ~/Downloads, ~/Work, ~/Documents/Obsidian Vault\n'
+  printf '  ~/.secrets/github-token          local token copy\n'
+  printf '  ~/.fcc/.env                      free-claude-code credentials\n'
+  printf '  ~/.bashrc                        contains TAVILY_API_KEY\n'
+  printf '  /etc/wireguard/wg-JP-446.conf    VPN private key (sudo)\n'
+  printf '  ~/Downloads, ~/Work, ~/Documents/Obsidian Vault, ~/Pictures, ~/Videos\n'
 
   if (( PUSH )); then
     if [[ -d "$REPO_DIR/.git" ]]; then
@@ -501,30 +660,124 @@ snapshot_all() {
 }
 
 print_post_restore() {
-  printf '\nPost-restore, log in again (interactive):\n'
+  local n=0
+  printf '\nPost-restore steps:\n'
+  n=$((n + 1))
   if ! gh auth status >/dev/null 2>&1; then
-    printf '  gh auth login && gh auth setup-git\n'
+    printf '  %d. gh auth login && gh auth setup-git\n' "$n"
   else
-    printf '  gh auth: already authenticated\n'
+    printf '  %d. gh auth: already authenticated\n' "$n"
   fi
+  n=$((n + 1))
   if [[ ! -f "$CODEX_HOME/auth.json" ]]; then
-    printf '  codex login\n'
+    printf '  %d. codex login\n' "$n"
   else
-    printf '  codex: already authenticated\n'
+    printf '  %d. codex: already authenticated\n' "$n"
   fi
+  n=$((n + 1))
   if [[ ! -f "$HOME_DIR/.config/instaloader/session-ivan_esteban23" ]]; then
-    printf '  log into instagram.com in Firefox, then:\n'
-    printf '    ig-download pdm.clara --new-only --cookies firefox\n'
+    printf '  %d. log into instagram.com in Firefox, then:\n' "$n"
+    printf '       ig-download pdm.clara --new-only --cookies firefox\n'
+  else
+    printf '  %d. Instagram session: already present\n' "$n"
   fi
-  printf '  restore personal data (Downloads, Work, Obsidian Vault) from backup\n'
-  printf '  verify: agent-rules-setup --check  then  agent-rules-setup --smoke\n'
+  n=$((n + 1))
+  printf '  %d. reinstall sidecar CLIs with their own installers:\n' "$n"
+  printf '       qodercli (Qoder), agy (Antigravity), reason, uv + free-claude-code\n'
+  n=$((n + 1))
+  printf '  %d. VPN: restore /etc/wireguard/wg-JP-446.conf (root), then:\n' "$n"
+  printf '       sudo systemctl enable --now wg-quick@wg-JP-446\n'
+  n=$((n + 1))
+  printf '  %d. restore personal data from backup:\n' "$n"
+  printf '       ~/Downloads, ~/Work, ~/Documents/Obsidian Vault, ~/Pictures, ~/Videos\n'
+  n=$((n + 1))
+  printf '  %d. verify: agent-rules-setup --check  then  agent-rules-setup --smoke\n' "$n"
+  printf '\nFull runbook: agent-rules-setup --restore-guide\n'
+}
+
+print_restore_guide() {
+  cat <<'GUIDE'
+
+Machine recovery runbook
+========================
+
+Before wiping the disk (old machine)
+------------------------------------
+  cd ~/Work/machine-setup
+  ./agent-rules-setup --pre-reset          # snapshot + commit + push + this guide
+
+  Back up separately (never in the repo):
+    ~/.ssh/                              signing key + allowed_signers
+    ~/.codex/auth.json                   Codex login
+    ~/.config/gh/hosts.yml               gh token
+    ~/.config/instaloader/session-*      Instagram session
+    ~/.secrets/github-token
+    ~/.fcc/.env
+    ~/.bashrc                            contains TAVILY_API_KEY
+    /etc/wireguard/wg-JP-446.conf        sudo cp
+    ~/Downloads, ~/Work, ~/Documents/Obsidian Vault, ~/Pictures, ~/Videos
+
+After reinstalling Omarchy
+--------------------------
+  # 1. GitHub CLI (mise ships with Omarchy)
+  mise use -g gh
+  gh auth login
+
+  # 2. Recovery kit (private repo)
+  mkdir -p ~/Work
+  gh repo clone ivan-esteban23/machine-setup ~/Work/machine-setup
+  cd ~/Work/machine-setup
+  ./agent-rules-setup --bootstrap          # add --with-packages for pacman/AUR
+
+  # 3. Interactive logins
+  gh auth setup-git
+  codex login
+
+  # 4. Instagram: log into instagram.com in Firefox, then prime the session
+  ig-download pdm.clara --new-only --cookies firefox
+
+  # 5. Verify
+  agent-rules-setup --check
+  agent-rules-setup --smoke
+
+Sidecar tools that need their own installer
+-------------------------------------------
+  uv / uvx              curl -LsSf https://astral.sh/uv/install.sh | sh
+  free-claude-code      uv tool install free-claude-code
+  qodercli              Qoder CLI installer
+  agy                   Antigravity installer
+  reason                Reason app installer
+
+Restored automatically from snapshot/config/
+--------------------------------------------
+  git aliases + ignore, starship prompt, alacritty, Hypr bindings,
+  Omarchy bar layout + default agent, fcitx5 profile and tray drop-in,
+  GTK_IM_MODULE fix, Obsidian vault registry, VS Code settings,
+  Qoder settings, Claude theme.
+
+Notes
+-----
+  * Existing personal config is never overwritten; only missing files are
+    restored. Re-snapshot with: ./agent-rules-setup --snapshot --push
+  * The VPN toggle needs /etc/wireguard/wg-JP-446.conf restored by hand.
+  * Signing stays off until ~/.ssh/id_ed25519_signing is restored.
+  * The repo is private; without GitHub access copy the directory to USB.
+GUIDE
 }
 
 # -----------------------------------------------------------------------------
 # Snapshot / bootstrap entry points
 # -----------------------------------------------------------------------------
+if (( RESTORE_GUIDE )); then
+  print_restore_guide
+  exit 0
+fi
+
 if [[ "$SNAPSHOT_MODE" -eq 1 ]]; then
   snapshot_all
+  if (( PRE_RESET )); then
+    print_restore_guide
+  fi
   if (( problems > 0 )); then
     exit 1
   fi
@@ -540,6 +793,13 @@ if [[ "$BOOTSTRAP" -eq 1 ]]; then
 fi
 
 # -----------------------------------------------------------------------------
+# 0. Personal config from the snapshot (only files that are missing)
+# -----------------------------------------------------------------------------
+if [[ -d "$SNAPSHOT_DIR/config" ]]; then
+  restore_configs
+fi
+
+# -----------------------------------------------------------------------------
 # 1. Rule files (never clobber local annotations unless --force)
 # -----------------------------------------------------------------------------
 install_rule() {
@@ -552,6 +812,22 @@ install_rule() {
   install_content "$path" 644 1 "$label"
 }
 install_rule "$HOME_DIR/AGENTS.md" "~/AGENTS.md" <<'RULE'
+# Autonomous Execution & Permission Rules
+
+- **Do Not Ask For Permission To Proceed**: The user has authorized all commands, scripts, tools, file modifications, and installations on this system.
+- **Direct Execution**: Always execute commands, file creations, and edits directly. Never prompt the user for confirmation or ask if you should proceed with routine or necessary operations.
+- **Proactive Problem Solving**: When a command or task needs to be performed to accomplish the user's objective, run it immediately.
+RULE
+
+install_rule "$HOME_DIR/GEMINI.md" "~/GEMINI.md" <<'RULE'
+# Autonomous Execution & Permission Rules
+
+- **Do Not Ask For Permission To Proceed**: The user has authorized all commands, scripts, tools, file modifications, and installations on this system.
+- **Direct Execution**: Always execute commands, file creations, and edits directly. Never prompt the user for confirmation or ask if you should proceed with routine or necessary operations.
+- **Proactive Problem Solving**: When a command or task needs to be performed to accomplish the user's objective, run it immediately.
+RULE
+
+install_rule "$HOME_DIR/.gemini/config/AGENTS.md" "~/.gemini/config/AGENTS.md" <<'RULE'
 # Autonomous Execution & Permission Rules
 
 - **Do Not Ask For Permission To Proceed**: The user has authorized all commands, scripts, tools, file modifications, and installations on this system.
@@ -662,6 +938,96 @@ fi
 echo "gh: mise could not update and no mise shim exists" >&2
 exit 1
 SH
+
+install_content "$BIN/obsidian" 755 1 "obsidian (CLI bridge)" <<'PY'
+#!/usr/bin/env python3
+"""Forward commands to Obsidian's native CLI socket on Arch Linux."""
+import json, os, pathlib, select, socket, subprocess, sys, time
+import termios, tty
+
+if len(sys.argv) == 1 and not sys.stdin.isatty():
+    args = ['--help']
+else:
+    args = sys.argv[1:]
+if args and args[0] == 'help':
+    args = args[1:] + ['--help']
+if args == ['--desktop']:
+    os.execv('/usr/bin/obsidian', ['/usr/bin/obsidian'])
+address = str(pathlib.Path(os.environ.get('XDG_RUNTIME_DIR', str(pathlib.Path.home()))) / '.obsidian-cli.sock')
+s = None
+for attempt in range(100):
+    candidate = socket.socket(socket.AF_UNIX)
+    try:
+        candidate.connect(address)
+        s = candidate
+        break
+    except OSError:
+        candidate.close()
+        if attempt == 0:
+            subprocess.Popen(['/usr/bin/obsidian'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        time.sleep(.2)
+if s is None:
+    sys.exit('Could not connect to Obsidian CLI within 20 seconds.')
+interactive = sys.stdin.isatty() and sys.stdout.isatty()
+s.sendall((json.dumps({'argv': args, 'tty': interactive, 'cwd': os.getcwd()}) + '\n').encode())
+previous = None
+try:
+    if interactive:
+        previous = termios.tcgetattr(sys.stdin.fileno())
+        tty.setraw(sys.stdin.fileno())
+    while True:
+        inputs = [s, sys.stdin] if interactive else [s]
+        ready, _, _ = select.select(inputs, [], [])
+        if s in ready:
+            data = s.recv(65536)
+            if not data:
+                break
+            sys.stdout.buffer.write(data)
+            sys.stdout.buffer.flush()
+        if interactive and sys.stdin in ready:
+            data = os.read(sys.stdin.fileno(), 4096)
+            if not data:
+                break
+            s.sendall(data)
+finally:
+    if previous is not None:
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, previous)
+    s.close()
+PY
+
+install_content "$BIN/wireguard-jp-toggle" 755 1 "wireguard-jp-toggle" <<'SH'
+#!/usr/bin/env bash
+set -u
+unit=wg-quick@wg-JP-446.service
+exec 9>"${XDG_RUNTIME_DIR:-/tmp}/wireguard-jp-toggle-$(id -u).lock"
+flock -n 9 || exit 0
+if systemctl is-active --quiet "$unit"; then
+ action=stop; message='Japan VPN disconnected'
+else
+ action=start; message='Japan VPN connected'
+fi
+if pkexec /usr/bin/systemctl "$action" "$unit"; then
+ notify-send 'WireGuard' "$message"
+else
+ notify-send -u critical 'WireGuard' 'Could not change the VPN connection. Check authentication and service status.'
+ exit 1
+fi
+SH
+
+install_mise_wrapper claude claude
+install_mise_wrapper codex codex
+install_mise_wrapper copilot copilot
+install_mise_wrapper crush crush
+install_mise_wrapper gemini gemini
+install_mise_wrapper grok "npm:@xai-official/grok"
+install_mise_wrapper hunk "aqua:modem-dev/hunk"
+install_mise_wrapper omp "github:can1357/oh-my-pi"
+install_mise_wrapper opencode opencode
+install_mise_wrapper pi pi
+install_mise_wrapper playwright "npm:playwright"
+install_mise_wrapper ghui "npm:@kitlangton/ghui"
+install_mise_wrapper cursor-agent cursor-agent
+install_mise_wrapper muse 'http:muse[url=https://api.meta.ai/muse-launcher.sh,bin=muse,version_list_url=https://api.meta.ai/muse-code/channels/muse-stable,version_json_path=.version]'
 
 install_content "$BIN/system-update-check" 755 1 "system-update-check" <<'SH'
 #!/usr/bin/env bash
@@ -1111,7 +1477,7 @@ Description=Check for pending system package updates
 
 [Service]
 Type=oneshot
-ExecStart=/home/ivanaguilera/.local/bin/system-update-check
+ExecStart=%h/.local/bin/system-update-check
 UNIT
 
 install_content "$UNIT_DIR/system-update-check.timer" 644 1 "system-update-check.timer" <<'UNIT'
@@ -1128,6 +1494,38 @@ RemainAfterElapse=no
 WantedBy=timers.target
 UNIT
 update_timer_changed=$LAST_CHANGED
+
+install_content "$UNIT_DIR/codex-remote-control.service" 644 1 "codex-remote-control.service" <<'UNIT'
+[Unit]
+Description=Codex remote access for Omarchy
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/share/mise/installs/codex/latest/bin/codex remote-control start --json
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=15
+TimeoutStartSec=120
+
+[Install]
+WantedBy=default.target
+UNIT
+
+install_content "$UNIT_DIR/qoder-remote-control.service" 644 1 "qoder-remote-control.service" <<'UNIT'
+[Unit]
+Description=Qoder remote control (mobile/browser access)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/qodercli remote-control --name omarchy --spawn same-dir --directory %h
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=default.target
+UNIT
 
 have_systemd() { systemctl --user show-environment >/dev/null 2>&1; }
 
@@ -1155,6 +1553,18 @@ if [[ "$ENABLE" -eq 1 ]] && have_systemd; then
         drift "$t could not be enabled"
       fi
     done
+    for s in "${SERVICES[@]}"; do
+      was="$(systemctl --user is-enabled "$s" 2>/dev/null || true)"
+      if systemctl --user enable "$s" >/dev/null 2>&1; then
+        if [[ "$was" == "enabled" ]]; then
+          ok "$s enabled"
+        else
+          fix "$s enabled (starts at next login)"
+        fi
+      else
+        drift "$s could not be enabled"
+      fi
+    done
   else
     for t in "${TIMERS[@]}"; do
       state="$(systemctl --user is-enabled "$t" 2>/dev/null || true)"
@@ -1164,6 +1574,14 @@ if [[ "$ENABLE" -eq 1 ]] && have_systemd; then
         ok "$t ($next)"
       else
         drift "$t (enabled=$state active=$active next=${next:-none})"
+      fi
+    done
+    for s in "${SERVICES[@]}"; do
+      state="$(systemctl --user is-enabled "$s" 2>/dev/null || true)"
+      if [[ "$state" == "enabled" ]]; then
+        ok "$s enabled"
+      else
+        drift "$s (enabled=$state)"
       fi
     done
   fi
@@ -1341,13 +1759,34 @@ fi
 # -----------------------------------------------------------------------------
 check_runtime() {
   local c
-  for c in mise git tmux checkupdates python3 gh codex; do
+  for c in mise git tmux checkupdates python3 gh codex flock; do
     if command -v "$c" >/dev/null 2>&1; then
       ok "command: $c"
     else
       drift "command missing: $c"
     fi
   done
+  if command -v uv >/dev/null 2>&1; then
+    if command -v fcc-claude >/dev/null 2>&1; then
+      ok "uv tool: free-claude-code"
+    else
+      note "uv tool missing: free-claude-code (uv tool install free-claude-code)"
+    fi
+  else
+    note "uv missing (sidecar installer: curl -LsSf https://astral.sh/uv/install.sh | sh)"
+  fi
+  for c in qodercli agy reason; do
+    if command -v "$c" >/dev/null 2>&1; then
+      ok "sidecar CLI: $c"
+    else
+      note "sidecar CLI missing: $c (install with its vendor installer)"
+    fi
+  done
+  if sudo_n test -f /etc/wireguard/wg-JP-446.conf 2>/dev/null; then
+    ok "WireGuard config"
+  else
+    note "WireGuard config missing: restore /etc/wireguard/wg-JP-446.conf"
+  fi
   if python3 -c 'import instaloader' >/dev/null 2>&1; then
     ok "python: instaloader"
   else
